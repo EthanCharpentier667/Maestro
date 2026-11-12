@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maestro — AI orchestrator</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎼</text></svg>">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<aside class="side">
+  <div class="brand"><span class="logo">🎼</span><div><b>Maestro</b><small>AI orchestrator</small></div></div>
+  <nav id="nav">
+    <a data-view="board" class="active"><i>▦</i>Board</a>
+    <a data-view="graph"><i>⌬</i>Graph</a>
+    <a data-view="machine"><i>⟳</i>State machine</a>
+    <a data-view="planner"><i>✦</i>Planner</a>
+    <a data-view="agents"><i>◉</i>Agents &amp; skills</a>
+    <a data-view="runs"><i>≣</i>Runs &amp; logs</a>
+    <a data-view="settings"><i>⚙</i>Settings</a>
+  </nav>
+  <div class="side-foot" id="side-foot"></div>
+</aside>
+
+<main>
+  <header class="top">
+    <div class="proj" id="proj">—</div>
+    <div class="kpis" id="kpis"></div>
+    <div class="top-actions">
+      <span class="sync-info" id="sync-info"></span>
+      <button class="btn ghost" id="btn-sync" title="Sync GitHub now">⟳ Sync</button>
+      <button class="btn engine" id="btn-engine">▶ Start engine</button>
+    </div>
+  </header>
+  <section id="view"></section>
+</main>
+
+<div id="drawer" class="drawer hidden"><div class="drawer-inner" id="drawer-inner"></div></div>
+<div id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>
