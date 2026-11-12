@@ -78,6 +78,7 @@ async fn state(AxState(app): AxState<AppRef>) -> R {
         "agents": app.lib.agents(),
         "skills": app.lib.skills().iter().map(|s| json!({"name": s.name, "description": s.description})).collect::<Vec<_>>(),
         "settings": s.redacted(),
+        "env_secrets": Settings::env_secrets(),
         "project": project,
         "stats": app.db.stats(),
         "statemachine": sm_json(),

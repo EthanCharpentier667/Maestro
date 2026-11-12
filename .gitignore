@@ -1,3 +1,4 @@
 /target
 /maestro-data
 *.db
+.env

@@ -152,11 +152,22 @@ impl Db {
             .optional()
             .ok()
             .flatten();
-        json.and_then(|j| serde_json::from_str::<Settings>(&j).ok())
+        let mut s = json.and_then(|j| serde_json::from_str::<Settings>(&j).ok())
             .unwrap_or_default()
-            .with_defaults()
+            .with_defaults();
+        s.apply_env();
+        s
     }
     pub fn save_settings(&self, s: &Settings) -> Result<()> {
+        let mut s = s.clone();
+        for f in Settings::env_secrets() {
+            match f {
+                "github_token" => s.github_token.clear(),
+                "claude_oauth_token" => s.claude_oauth_token.clear(),
+                _ => s.anthropic_api_key.clear(),
+            }
+        }
+        let s = &s;
         let c = self.conn.lock();
         c.execute(
             "INSERT INTO settings(id,json) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET json=excluded.json",

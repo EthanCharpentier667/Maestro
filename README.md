@@ -26,15 +26,20 @@ claude   # run once and /login with your Claude account
 ## Running
 
 ```bash
-./run.sh   # cargo build --release && ./target/release/maestro
+cp .env.example .env   # then fill in your secrets
+./run.sh               # cargo build --release && ./target/release/maestro
 ```
 
 Then open http://127.0.0.1:7878.
 
-Environment variables (all optional):
+Maestro reads a `.env` file from the working directory at startup (see `.env.example`). Secrets set there
+override the Settings page and are never written to the database.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `MAESTRO_GITHUB_TOKEN` | | GitHub personal access token (`repo` and `project` scopes). |
+| `MAESTRO_CLAUDE_OAUTH_TOKEN` | | Token from `claude setup-token` (also reads `CLAUDE_CODE_OAUTH_TOKEN`). |
+| `MAESTRO_ANTHROPIC_API_KEY` | | Anthropic API key (also reads `ANTHROPIC_API_KEY`). |
 | `MAESTRO_ADDR` | `127.0.0.1:7878` | Listen address. Keep it on localhost, the UI has no authentication. |
 | `MAESTRO_DATA` | `./maestro-data` | Database, agents, skills, clones, worktrees. |
 | `MAESTRO_GITHUB_API` | `https://api.github.com` | For GitHub Enterprise, e.g. `https://ghe.example.com/api/v3`. |
@@ -120,7 +125,10 @@ queued right away.
 ## Security
 
 - The UI has no authentication. Keep `MAESTRO_ADDR` bound to `127.0.0.1`.
-- Tokens are stored in plain text in `maestro-data/maestro.db`. The GitHub token is never written to git config.
+- Put secrets in `.env` (git-ignored). Secrets entered in the Settings page instead are stored in plain text in
+  `maestro-data/maestro.db`. The GitHub token is never written to git config.
+- In `account` mode, `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are removed from the Claude Code
+  environment so the local login is always used.
 - Agents run code on your machine. The default is `acceptEdits` with a per-agent tool allow-list.
   Only use `bypassPermissions` on a dedicated machine or VM.
 - The orchestrator and the reviewer run read-only (`Edit` and `Write` are disallowed).

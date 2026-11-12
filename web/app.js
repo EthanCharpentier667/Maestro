@@ -58,7 +58,7 @@ async function load() {
   const d = await api('/api/state');
   S.tickets = new Map(d.tickets.map(t => [t.id, t]));
   S.agents = d.agents; S.skills = d.skills; S.settings = d.settings; S.project = d.project; S.stats = d.stats;
-  S.sm = d.statemachine; S.runs = d.runs; S.busy = d.busy; S.lastSync = d.last_sync; S.claudeVersion = d.claude_version;
+  S.envSecrets = d.env_secrets || []; S.sm = d.statemachine; S.runs = d.runs; S.busy = d.busy; S.lastSync = d.last_sync; S.claudeVersion = d.claude_version;
   renderChrome(); render();
 }
 
@@ -470,8 +470,12 @@ function agentEditor() {
 // ───────── SETTINGS
 function viewSettings() {
   const s = structuredClone(S.settings);
-  const inp = (k, label, help, type = 'text', extra = {}) => h('label', { class: 'f' }, h('span', {}, label),
-    h('input', { type, value: s[k] ?? '', oninput: e => s[k] = type === 'number' ? +e.target.value : e.target.value, ...extra }), help ? h('small', {}, help) : null);
+  const inp = (k, label, help, type = 'text', extra = {}) => {
+    const env = (S.envSecrets || []).includes(k);
+    return h('label', { class: 'f' }, h('span', {}, label),
+      h('input', { type, value: env ? '' : (s[k] ?? ''), disabled: env, placeholder: env ? 'Set in .env' : '', oninput: e => s[k] = type === 'number' ? +e.target.value : e.target.value, ...extra }),
+      env ? h('small', {}, 'Provided by the environment (.env), not stored in the database') : help ? h('small', {}, help) : null);
+  };
   const sel = (k, label, opts, help) => h('label', { class: 'f' }, h('span', {}, label),
     h('select', { onchange: e => { s[k] = e.target.value; } }, opts.map(([v, l]) => h('option', { value: v, selected: s[k] === v }, l))), help ? h('small', {}, help) : null);
   const chk = (k, label) => h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: !!s[k], onchange: e => s[k] = e.target.checked }), label);
@@ -489,15 +493,15 @@ function viewSettings() {
         sel('claude_auth', 'Authentication', [['account', 'My Claude account (local `claude` login — Pro/Max)'], ['oauth_token', 'Long-lived token (`claude setup-token`)'], ['api_key', 'Anthropic API key (pay as you go)']],
           'Account mode = whatever `claude` is logged into on this machine (run `claude` once and /login).'),
         inp('claude_bin', 'Claude binary', 'Path or command name, e.g. claude or /opt/homebrew/bin/claude'),
-        inp('claude_oauth_token', 'OAuth token', 'From `claude setup-token` — stored locally only', 'password'),
-        inp('anthropic_api_key', 'API key', 'sk-ant-… — stored locally only', 'password'),
+        inp('claude_oauth_token', 'OAuth token', 'From `claude setup-token`. Prefer MAESTRO_CLAUDE_OAUTH_TOKEN in .env', 'password'),
+        inp('anthropic_api_key', 'API key', 'Prefer MAESTRO_ANTHROPIC_API_KEY in .env', 'password'),
         sel('permission_mode', 'Permission mode for workers', [['acceptEdits', 'acceptEdits — edits auto-approved, tools per agent allow-list'], ['bypassPermissions', 'bypassPermissions — everything allowed (isolated machines only)'], ['default', 'default — only allow-listed tools']]),
         inp('default_model', 'Default model', 'Used when an agent has no model (empty = Claude Code default)'),
         inp('max_budget_usd', 'Max budget per run (USD, 0 = none)', 'Only meaningful for API-key billing', 'number', { step: '0.5' }))),
     h('div', { class: 'card', style: 'margin-top:14px' }, h('div', { class: 'h' }, h('h3', {}, '2 · GitHub'), test('/api/settings/test-github', 'Test GitHub')),
       h('div', { class: 'grid2' },
         sel('github_auth', 'Authentication', [['token', 'Personal access token'], ['gh_cli', 'Use `gh auth token` (GitHub CLI login)']]),
-        inp('github_token', 'Token', 'Classic PAT with scopes: repo, project (or fine-grained: issues, PRs, contents RW + projects RW)', 'password'),
+        inp('github_token', 'Token', 'Classic PAT with scopes repo + project. Prefer MAESTRO_GITHUB_TOKEN in .env', 'password'),
         inp('project_owner', 'Project owner (user or org)', 'e.g. Miou-zora'),
         inp('project_number', 'Project number', 'github.com/users/<owner>/projects/<number>', 'number'),
         inp('status_field', 'Status field name', 'Single-select field used as kanban columns'),

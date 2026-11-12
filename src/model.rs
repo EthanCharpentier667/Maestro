@@ -252,6 +252,26 @@ impl Settings {
         s
     }
 
+    /// Secrets provided by the environment (.env) win over the database and are
+    /// never persisted. Returns the settings field names that come from the env.
+    pub fn apply_env(&mut self) -> Vec<&'static str> {
+        let mut from_env = vec![];
+        let mut take = |field: &'static str, vars: &[&str], dst: &mut String| {
+            if let Some(v) = vars.iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty())) {
+                *dst = v.trim().to_string();
+                from_env.push(field);
+            }
+        };
+        take("github_token", &["MAESTRO_GITHUB_TOKEN"], &mut self.github_token);
+        take("claude_oauth_token", &["MAESTRO_CLAUDE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"], &mut self.claude_oauth_token);
+        take("anthropic_api_key", &["MAESTRO_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"], &mut self.anthropic_api_key);
+        from_env
+    }
+
+    pub fn env_secrets() -> Vec<&'static str> {
+        Settings::default().apply_env()
+    }
+
     pub fn repo_path(&self, repo: &str) -> Option<String> {
         self.repo_paths.lines().find_map(|l| {
             let (k, v) = l.split_once('=')?;

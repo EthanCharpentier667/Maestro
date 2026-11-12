@@ -50,10 +50,12 @@ pub fn base_command(s: &Settings) -> Command {
         }
         "api_key" if !s.anthropic_api_key.is_empty() => {
             cmd.env("ANTHROPIC_API_KEY", &s.anthropic_api_key);
+            cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
         }
         _ => {
-            // account mode: rely on the local login, never on a stray API key
+            // account mode: rely on the local login, never on a stray key/token
             cmd.env_remove("ANTHROPIC_API_KEY");
+            cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
         }
     }
     cmd
