@@ -1,144 +1,166 @@
-# 🎼 Maestro — orchestrateur IA pour ton kanban GitHub
+# Maestro
 
-Maestro transforme un **GitHub Project (V2)** en équipe de développement IA :
-tu déplaces une carte dans la colonne déclencheur, un **orchestrateur** analyse le ticket, le route vers le bon
-**spécialiste** (engine, gamedev, gamedesign, devops…) ou le découpe en sous-tickets avec dépendances.
-Chaque spécialiste code dans **son propre git worktree** via **Claude Code** sur ta machine, ouvre une **PR**,
-un **reviewer** la relit (boucle de corrections), et le kanban GitHub est mis à jour tout seul.
+Maestro turns a GitHub Project (V2) board into a team of AI agents.
 
-- **Backend Rust** (axum + tokio + SQLite) : un seul binaire, ~10 Mo, UI embarquée.
-- **Claude Code en local** : utilise *ton compte Claude* (Pro/Max), un token `claude setup-token`, ou une clé API.
-- **UI web temps réel** (SSE) : Board, Graph (DAG des tickets), State machine animée, Planner, Agents & skills, logs live.
+Move a card into the trigger column and an orchestrator agent triages it: it either assigns the ticket to a
+specialist (engine, gameplay, game design, devops...), splits it into sub-tickets with dependencies, or asks
+a clarifying question. Each specialist works in its own git worktree using Claude Code on your machine, Maestro
+pushes the branch and opens a pull request, a reviewer agent checks it (and sends it back for fixes if needed),
+and the board columns are kept in sync along the way.
 
----
+- Rust backend (axum, tokio, SQLite), single binary with the web UI embedded.
+- Runs the local Claude Code CLI: uses your Claude account (Pro/Max), a `claude setup-token` token, or an API key.
+- Live web UI (server-sent events): board, ticket dependency graph, state machine view, planner, agent and skill editor, run logs.
 
-## Installation (macOS / Linux)
+## Requirements
 
-Prérequis : [Rust](https://rustup.rs), `git`, et Claude Code :
+- [Rust](https://rustup.rs)
+- `git`
+- Claude Code:
 
 ```bash
 npm i -g @anthropic-ai/claude-code
-claude            # une fois, puis /login avec ton compte Claude
+claude   # run once and /login with your Claude account
 ```
 
-Lancer :
+## Running
 
 ```bash
-./run.sh          # = cargo build --release && ./target/release/maestro
-# → http://127.0.0.1:7878
+./run.sh   # cargo build --release && ./target/release/maestro
 ```
 
-Variables d'env optionnelles :
+Then open http://127.0.0.1:7878.
 
-| Variable | Défaut | Rôle |
+Environment variables (all optional):
+
+| Variable | Default | Purpose |
 |---|---|---|
-| `MAESTRO_ADDR` | `127.0.0.1:7878` | adresse d'écoute (laisse en localhost : pas d'auth sur l'UI) |
-| `MAESTRO_DATA` | `./maestro-data` | DB, agents, skills, clones, worktrees |
-| `MAESTRO_GITHUB_API` | `https://api.github.com` | GitHub Enterprise : `https://ghe.x.com/api/v3` |
-| `MAESTRO_GIT_BASE` | `https://github.com` | hôte git (GHE) |
-| `RUST_LOG` | `maestro=info` | logs |
+| `MAESTRO_ADDR` | `127.0.0.1:7878` | Listen address. Keep it on localhost, the UI has no authentication. |
+| `MAESTRO_DATA` | `./maestro-data` | Database, agents, skills, clones, worktrees. |
+| `MAESTRO_GITHUB_API` | `https://api.github.com` | For GitHub Enterprise, e.g. `https://ghe.example.com/api/v3`. |
+| `MAESTRO_GIT_BASE` | `https://github.com` | Git host (GitHub Enterprise). |
+| `RUST_LOG` | `maestro=info` | Log level. |
 
-## Configuration (onglet Settings)
+## Configuration
+
+Everything is configured from the Settings page.
 
 1. **Claude Code**
-   - `account` → utilise le login local de `claude` (abonnement Pro/Max, les limites d'usage de l'abonnement s'appliquent).
-   - `oauth_token` → token longue durée généré par `claude setup-token` (pratique sur un serveur / une autre machine).
-   - `api_key` → clé `ANTHROPIC_API_KEY` facturée à l'usage.
-   - Bouton **Test Claude** pour vérifier.
-2. **GitHub** : un PAT classique (scopes `repo` + `project`) ou `gh auth login` puis mode *gh CLI*.
-   Renseigne le propriétaire et le numéro du projet (`github.com/users/<owner>/projects/<n>`), le champ de statut
-   (`Status`) et les noms de colonnes. **Test GitHub** liste les colonnes trouvées et celles qui manquent.
-3. **Engine** : nombre d'agents en parallèle, tentatives, rounds de review, auto-merge…
-4. **Git** : branche de base, et éventuellement des chemins locaux `owner/repo=/chemin/du/repo`
-   (sinon Maestro clone dans son dossier de données).
+   - `account`: uses whatever the local `claude` CLI is logged into. Your subscription's usage limits apply.
+   - `oauth_token`: a long-lived token from `claude setup-token`, useful on a server or another machine.
+   - `api_key`: an `ANTHROPIC_API_KEY`, billed per use.
+   - Use "Test Claude" to check the setup.
+2. **GitHub**: a classic personal access token with `repo` and `project` scopes, or `gh auth login` and the
+   "gh CLI" mode. Set the project owner and number (`github.com/users/<owner>/projects/<number>`), the status
+   field name (`Status` by default) and the column names. "Test GitHub" lists the columns it found and any that are missing.
+3. **Engine**: number of parallel agents, attempts per ticket, review rounds, auto-merge, always-triage.
+4. **Git**: base branch, and optional local paths (`owner/repo=/path/to/repo`, one per line). Without a path,
+   Maestro clones the repository into its data directory.
 
-Puis **▶ Start engine** en haut à droite.
+Then click "Start engine".
 
-## Comment ça marche
+## How it works
 
 ```
-GitHub Project ──sync (poll)──► tickets locaux ──► state machine ──► Claude Code (worktree/branche par ticket)
-      ▲                                                                    │
-      └──────── statut de colonne, commentaires, PR, merge ◄───────────────┘
+GitHub Project --(polling sync)--> local tickets --> state machine --> Claude Code (one worktree/branch per ticket)
+      ^                                                                       |
+      +------------- column status, comments, pull requests, merges <--------+
 ```
 
-### State machine d'un ticket
+### Ticket states
 
-`backlog → triage → (ready | blocked | split | needs_human) → running → reviewing ⇄ running → awaiting_merge → done`
+```
+backlog -> triage -> ready | blocked | split | needs_human
+ready -> running -> reviewing <-> running -> awaiting_merge -> done
+```
 
-- **triage** : routage direct si le ticket a un label `agent:<nom>` ou un label déclaré par un agent,
-  sinon l'orchestrateur décide (`assign`, `split` en sous-tickets avec `depends_on`, ou `clarify` → il pose une question en commentaire).
-- **blocked** : attend que ses dépendances soient `done`. Les dépendances sont lues dans le corps des issues
-  (`Depends on #12`, `Blocked by #3`, `Requires owner/repo#5`) et éditables dans l'UI.
-- **split** : passe à `done` quand tous les sous-tickets sont terminés.
-- **running** : l'agent travaille sur `maestro/<n>-<titre>` dans un worktree isolé, commit ; Maestro push et ouvre la PR (`Closes #n`).
-- **reviewing** : le reviewer (lecture seule) approuve ou renvoie un feedback au worker, qui corrige sur la même branche.
-- **awaiting_merge** : tu merges (sur GitHub ou bouton *Merge PR*), ou auto-merge. Une PR mergée / issue fermée → `done`.
-- **needs_human** : échec, aucun changement, question de l'orchestrateur… Boutons *Retriage* / *Retry agent*.
+- **triage**: tickets with an `agent:<name>` label, or a label listed by an agent, go straight to that agent.
+  Otherwise the orchestrator decides: `assign`, `split` (sub-tickets with `depends_on`), or `clarify`
+  (it posts a question on the issue).
+- **blocked**: waiting for dependencies to reach `done`. Dependencies are parsed from issue bodies
+  (`Depends on #12`, `Blocked by #3`, `Requires owner/repo#5`) and can be edited in the UI.
+- **split**: becomes `done` once all of its sub-tickets are done.
+- **running**: the agent works on `maestro/<number>-<title>` in an isolated worktree and commits.
+  Maestro pushes the branch and opens a PR that closes the issue.
+- **reviewing**: the reviewer (read-only) approves or sends feedback; the worker fixes it on the same branch.
+- **awaiting_merge**: merge on GitHub, with the "Merge PR" button, or enable auto-merge. A merged PR or closed issue moves the ticket to `done`.
+- **needs_human**: the agent failed, produced no changes, or the orchestrator needs an answer. Use "Retriage" or "Retry agent".
 
-Le diagramme de l'onglet **State machine** est généré depuis la même table de transitions que le moteur (`src/model.rs`).
+The state machine page is generated from the same transition table the engine enforces (`src/model.rs`).
 
-### Agents & skills
+### Agents and skills
 
-Les agents sont des fichiers Markdown dans `maestro-data/agents/` (éditables dans l'UI) :
+Agents are Markdown files in `maestro-data/agents/`, editable from the UI:
 
 ```markdown
 ---
 name: engine
-description: Engine programmer — C++/Rust core systems…   # sert à l'orchestrateur pour router
+description: Engine programmer - C++/Rust core systems...   # used by the orchestrator for routing
 role: worker            # worker | orchestrator | reviewer
-model: sonnet           # opus | sonnet | haiku | id complet
+model: sonnet           # opus | sonnet | haiku | full model id
 color: '#4f8cff'
-labels: [engine, rendering]      # labels GitHub routés directement vers lui
-tools: [Read, Edit, Write, Glob, Grep, Bash]   # --allowedTools
+labels: [engine, rendering]                     # GitHub labels routed directly to this agent
+tools: [Read, Edit, Write, Glob, Grep, Bash]    # passed as --allowedTools
 skills: [cpp-engine, commit-conventions]
 ---
-Prompt système ajouté à Claude Code…
+Appended to Claude Code's system prompt.
 ```
 
-Les **skills** sont des dossiers `SKILL.md` standards de Claude Code (`maestro-data/skills/`). Pour chaque agent, Maestro
-génère un plugin Claude Code contenant ses skills et le charge avec `--plugin-dir` : chaque spécialiste n'a que ses skills.
+Skills are standard Claude Code `SKILL.md` folders in `maestro-data/skills/`. For each agent, Maestro generates a
+Claude Code plugin containing only that agent's skills and loads it with `--plugin-dir`.
 
-Équipe par défaut : `orchestrator` (opus), `engine`, `gamedev`, `gamedesign`, `devops`, `reviewer`.
+Default team: `orchestrator`, `engine`, `gamedev`, `gamedesign`, `devops`, `reviewer`.
 
 ### Planner
 
-Onglet **Planner** : tu décris un objectif (« ajouter un dash au joueur… »), l'orchestrateur inspecte le repo et propose un
-graphe de tickets (agent + dépendances). Tu édites, puis **Create issues** : les issues sont créées dans le repo, ajoutées
-au projet, et (si coché) mises en file directement.
+Describe a goal in the Planner page. The orchestrator reads the repository and proposes a set of tickets with
+agents and dependencies. Edit them, then create the issues: they are added to the project and, optionally,
+queued right away.
 
-## Sécurité
+## Security
 
-- L'UI n'a **pas d'authentification** : garde `MAESTRO_ADDR` sur `127.0.0.1`.
-- Tokens stockés en clair dans `maestro-data/maestro.db` (local). Le token GitHub n'est jamais écrit dans la config git.
-- Les agents exécutent du code sur ta machine. `acceptEdits` + une allow-list d'outils par agent est le défaut ;
-  `bypassPermissions` uniquement sur une machine/VM dédiée.
-- L'orchestrateur et le reviewer tournent en lecture seule (`Edit/Write` interdits).
+- The UI has no authentication. Keep `MAESTRO_ADDR` bound to `127.0.0.1`.
+- Tokens are stored in plain text in `maestro-data/maestro.db`. The GitHub token is never written to git config.
+- Agents run code on your machine. The default is `acceptEdits` with a per-agent tool allow-list.
+  Only use `bypassPermissions` on a dedicated machine or VM.
+- The orchestrator and the reviewer run read-only (`Edit` and `Write` are disallowed).
 
-## Développement
+## Project layout
 
 ```
 src/
-  main.rs      boot, boucles, serveur
-  model.rs     types + state machine (transitions autorisées)
-  db.rs        SQLite (tickets, deps, transitions, runs, logs)
-  github.rs    Projects V2 GraphQL + REST (issues, commentaires, PR)
-  claude.rs    lancement `claude -p --output-format stream-json`, parsing, annulation
+  main.rs      startup, background loops, HTTP server
+  model.rs     types and the state machine (allowed transitions)
+  db.rs        SQLite: tickets, dependencies, transitions, runs, logs
+  github.rs    Projects V2 GraphQL and REST (issues, comments, pull requests)
+  claude.rs    runs `claude -p --output-format stream-json`, parses events, cancellation
   git.rs       clones, worktrees, push
   engine.rs    sync, scheduler, triage, worker, review, planner
-  api.rs       API HTTP + SSE + UI embarquée
-web/           index.html, app.js, style.css (vanilla, sans build)
-agents/ skills/  équipe par défaut (copiée dans maestro-data au 1er lancement)
-tests/         mock GitHub + faux `claude` pour tester tout le cycle sans réseau
+  api.rs       HTTP API, SSE, embedded UI
+web/           index.html, app.js, style.css (plain JS, no build step)
+agents/        default agents (copied to maestro-data on first start)
+skills/        default skills
+tests/         GitHub mock and fake `claude` CLI for end-to-end tests
 ```
 
-Test de bout en bout sans GitHub ni Claude :
+## Testing
+
+Unit tests:
+
+```bash
+cargo test
+```
+
+End-to-end without GitHub or Claude:
 
 ```bash
 python3 tests/mock_github.py 8787 &
-mkdir -p /tmp/mtest/remotes/me && git init --bare -b main /tmp/mtest/remotes/me/game.git   # + un commit initial sur main
+mkdir -p /tmp/mtest/remotes/me && git init --bare -b main /tmp/mtest/remotes/me/game.git   # then push an initial commit to main
 MAESTRO_GITHUB_API=http://127.0.0.1:8787 MAESTRO_GIT_BASE=file:///tmp/mtest/remotes cargo run --release
-# Settings : claude_bin = tests/fake_claude.sh, token = x, owner = me, project = 1
 ```
 
-`cargo test` couvre le parsing des dépendances et la state machine.
+In Settings, set the Claude binary to `tests/fake_claude.sh`, any token, owner `me`, project `1`.
+
+## License
+
+MIT
