@@ -1,4 +1,4 @@
-//! Maestro — GitHub Projects kanban → team of specialised Claude Code agents.
+//! Maestro — GitHub repositories / Projects → team of specialised Claude Code agents.
 //!
 //! Env:
 //!   MAESTRO_ADDR  listen address        (default 127.0.0.1:7878)
@@ -7,6 +7,7 @@
 mod agents;
 mod api;
 mod app;
+mod chat;
 mod claude;
 mod db;
 mod engine;
@@ -14,6 +15,7 @@ mod git;
 mod mcp;
 mod github;
 mod model;
+mod projects;
 
 use app::App;
 use parking_lot::Mutex;
@@ -54,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         repo_locks: Mutex::new(HashMap::new()),
         base_url: format!("http://{}", addr.replace("0.0.0.0", "127.0.0.1").replace("[::]", "[::1]")),
         mcp_created: Mutex::new(HashMap::new()),
+        chat_runs: Mutex::new(HashMap::new()),
     });
 
     tokio::spawn(engine::sync_loop(app.clone()));

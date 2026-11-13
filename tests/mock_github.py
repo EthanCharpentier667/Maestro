@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Minimal in-memory GitHub mock (GraphQL Projects V2 + REST issues/PRs) for end-to-end tests.
+"""Minimal in-memory GitHub mock (GraphQL Projects V2 + REST repos/issues/labels/PRs) for end-to-end tests.
 Run: python3 tests/mock_github.py 8787   then MAESTRO_GITHUB_API=http://127.0.0.1:8787"""
-import json, re, sys
+import json, re, sys, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 OPTS = [("o1", "Backlog"), ("o2", "Todo"), ("o3", "In Progress"), ("o4", "In Review"), ("o5", "Done")]
@@ -10,7 +10,14 @@ issues = {}   # number -> dict
 items = {}    # item id -> {"issue": n, "status": name}
 pulls = {}
 comments = []
+labels_created = []
+repos_created = []
+projects_created = []
 n_issue = [0]; n_pr = [100]
+
+def issue_json(i):
+    return {"number": i["number"], "title": i["title"], "body": i["body"], "node_id": i["node_id"], "html_url": f"http://x/issues/{i['number']}",
+            "state": "closed" if i["state"] == "CLOSED" else "open", "labels": [{"name": l} for l in i["labels"]]}
 
 def add_issue(title, body, status="Backlog", labels=()):
     n_issue[0] += 1; n = n_issue[0]
@@ -33,8 +40,17 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = self.path.split("?")[0]
-        if p == "/state": return self.send({"issues": issues, "items": items, "pulls": pulls, "comments": comments})
-        if p == f"/repos/{REPO}": return self.send({"default_branch": "main"})
+        if p == "/state": return self.send({"issues": issues, "items": items, "pulls": pulls, "comments": comments, "labels_created": labels_created, "repos_created": repos_created, "projects_created": projects_created})
+        if p == f"/repos/{REPO}": return self.send({"default_branch": "main", "full_name": REPO, "node_id": "R_1", "private": True, "has_issues": True, "permissions": {"push": True}})
+        if p == "/user/repos": return self.send([{"full_name": REPO, "archived": False}, {"full_name": "me/engine", "archived": False}])
+        if p == f"/repos/{REPO}/issues":
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            st = q.get("state", ["open"])[0]; page = int(q.get("page", ["1"])[0])
+            if page > 1: return self.send([])
+            sel = [i for i in issues.values() if st == "all" or (st == "open") == (i["state"] == "OPEN")]
+            return self.send([issue_json(i) for i in sel])
+        m = re.match(rf"/repos/{REPO}/issues/(\d+)$", p)
+        if m: return self.send(issue_json(issues[int(m[1])])) if int(m[1]) in issues else self.send({"message": "Not Found"}, 404)
         m = re.match(rf"/repos/{REPO}/issues/(\d+)/comments", p)
         if m: return self.send([{"user": {"login": c["by"]}, "body": c["body"]} for c in comments if c["n"] == int(m[1])])
         if p == f"/repos/{REPO}/pulls":
@@ -48,6 +64,14 @@ class H(BaseHTTPRequestHandler):
         m = re.match(rf"/repos/{REPO}/issues/(\d+)$", self.path); b = self.body()
         if m and "state" in b:
             issues[int(m[1])]["state"] = "CLOSED" if b["state"] == "closed" else "OPEN"; return self.send({})
+        self.send({}, 404)
+
+    def do_DELETE(self):
+        m = re.match(rf"/repos/{REPO}/issues/(\d+)/labels/(.+)$", self.path)
+        if m:
+            name = urllib.parse.unquote(m[2]); i = issues[int(m[1])]
+            if name in i["labels"]: i["labels"].remove(name); return self.send([{"name": l} for l in i["labels"]])
+            return self.send({"message": "Label does not exist"}, 404)
         self.send({}, 404)
 
     def do_PUT(self):
@@ -64,6 +88,17 @@ class H(BaseHTTPRequestHandler):
             n = add_issue(b["title"], b["body"], None, b.get("labels", []))
             items[f"PVTI_{n}"]["status"] = None
             return self.send({"number": n, "html_url": f"http://x/issues/{n}", "node_id": f"I_{n}"}, 201)
+        m = re.match(rf"/repos/{REPO}/issues/(\d+)/labels$", p)
+        if m:
+            i = issues[int(m[1])]
+            for l in b["labels"]:
+                if l not in i["labels"]: i["labels"].append(l)
+            return self.send([{"name": l} for l in i["labels"]])
+        if p == f"/repos/{REPO}/labels":
+            if b["name"] in labels_created: return self.send({"message": "already_exists"}, 422)
+            labels_created.append(b["name"]); return self.send({"name": b["name"]}, 201)
+        if p == "/user/repos":
+            repos_created.append(b); return self.send({"full_name": f"tester/{b['name']}", "html_url": f"http://x/tester/{b['name']}", "private": b["private"], "default_branch": "main"}, 201)
         m = re.match(rf"/repos/{REPO}/issues/(\d+)/comments", p)
         if m: comments.append({"n": int(m[1]), "by": "maestro", "body": b["body"]}); return self.send({}, 201)
         if p == f"/repos/{REPO}/pulls":
@@ -74,6 +109,12 @@ class H(BaseHTTPRequestHandler):
 
     def graphql(self, q, v):
         if "viewer" in q: return self.send({"data": {"viewer": {"login": "tester"}}})
+        if "repositoryOwner" in q: return self.send({"data": {"repositoryOwner": {"id": "U_1"}}})
+        if "createProjectV2" in q:
+            projects_created.append(v["t"]); return self.send({"data": {"createProjectV2": {"projectV2": {"id": "PVT_1", "number": 1, "url": "http://x/p/1"}}}})
+        if "linkProjectV2ToRepository" in q: return self.send({"data": {"linkProjectV2ToRepository": {"repository": {"id": "R_1"}}}})
+        if "options{ name color" in q: return self.send({"data": {"node": {"options": [{"name": n, "color": "GRAY", "description": ""} for _, n in OPTS]}}})
+        if "updateProjectV2Field(" in q: return self.send({"data": {"updateProjectV2Field": {"projectV2Field": {"id": "F_status"}}}})
         if "projectV2(number" in q:
             kind = "organization" if "organization(" in q else "user"
             if kind == "organization": return self.send({"data": {"organization": None}, "errors": [{"message": "no org"}]})

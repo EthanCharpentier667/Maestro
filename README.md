@@ -1,16 +1,21 @@
 # Maestro
 
-Maestro turns a GitHub Project (V2) board into a team of AI agents.
+Maestro turns GitHub issues into pull requests with a team of AI agents.
 
-Move a card into the trigger column and an orchestrator agent triages it: it either assigns the ticket to a
+Point it at one or more repositories (or at a GitHub Project board), label an issue `maestro` (or move a card into
+the trigger column of the board) and an orchestrator agent triages it: it either assigns the ticket to a
 specialist (engine, gameplay, game design, devops...) or to a cell (a group of agents), splits it into
 sub-tickets with dependencies, or asks a clarifying question. Each specialist works in its own git worktree using Claude Code on your machine, Maestro
 pushes the branch and opens a pull request, a reviewer agent checks it (and sends it back for fixes if needed),
-and the board columns are kept in sync along the way.
+and the issue's `maestro:*` status labels (or the board columns) are kept in sync along the way.
+
+An **Assistant** you chat with in the UI knows how Maestro works and drives it for you: it can create a GitHub
+repository and watch it, create a GitHub Project board and mirror it, plan a goal into tickets, report progress,
+explain a failed run from its log and unblock tickets.
 
 - Rust backend (axum, tokio, SQLite), single binary with the web UI embedded.
 - Runs the local Claude Code CLI: uses your Claude account (Pro/Max), a `claude setup-token` token, or an API key.
-- Live web UI (server-sent events): board, ticket dependency graph, state machine view, planner, agent and skill editor, run logs.
+- Live web UI (server-sent events): assistant chat, board, ticket dependency graph, state machine view, planner, agent and skill editor, run logs.
 
 ## Requirements
 
@@ -37,7 +42,7 @@ override the Settings page and are never written to the database.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MAESTRO_GITHUB_TOKEN` | | GitHub personal access token (`repo` and `project` scopes). |
+| `MAESTRO_GITHUB_TOKEN` | | GitHub personal access token (`repo`; `project` for boards; `admin:org` to create organization repositories). |
 | `MAESTRO_CLAUDE_OAUTH_TOKEN` | | Token from `claude setup-token` (also reads `CLAUDE_CODE_OAUTH_TOKEN`). |
 | `MAESTRO_ANTHROPIC_API_KEY` | | Anthropic API key (also reads `ANTHROPIC_API_KEY`). |
 | `MAESTRO_ADDR` | `127.0.0.1:7878` | Listen address. Keep it on localhost, the UI has no authentication. |
@@ -55,16 +60,24 @@ Everything is configured from the Settings page.
    - `oauth_token`: a long-lived token from `claude setup-token`, useful on a server or another machine.
    - `api_key`: an `ANTHROPIC_API_KEY`, billed per use.
    - Use "Test Claude" to check the setup.
-2. **GitHub**: a classic personal access token with `repo` and `project` scopes, or `gh auth login` and the
-   "gh CLI" mode. Set the project owner and number (`github.com/users/<owner>/projects/<number>`), the status
-   field name (`Status` by default) and the column names. "Test GitHub" lists the columns it found and any that are missing.
-3. **Execution**: number of parallel agents, attempts per ticket, review rounds, auto-merge, always-triage.
-4. **Git**: base branch, and optional local paths (`owner/repo=/path/to/repo`, one per line). Without a path,
+2. **GitHub access**: a classic personal access token with the `repo` scope (plus `project` for GitHub boards), or
+   `gh auth login` and the "gh CLI" mode.
+3. **Project** (where tickets come from), one of:
+   - **Repositories** (default): `owner/name` per line, the primary first. Maestro imports their open issues; an issue
+     carrying the **trigger label** (`maestro`) is picked up, and progress is shown with the labels
+     `maestro:in-progress`, `maestro:in-review`, `maestro:done` (created on the repositories for you). Optionally,
+     **mirror** to a GitHub Project board: issues are added to it and its Status column follows the labels.
+   - **GitHub Project board**: owner and number (`github.com/users/<owner>/projects/<number>`), the status field
+     (`Status`) and the column names; cards moved to the trigger column (`Todo`) are picked up.
+   "Test connection" checks the repositories (push access) and the board columns.
+4. **Execution**: number of parallel agents, attempts per ticket, review rounds, auto-merge, always-triage.
+5. **Git**: base branch, and optional local paths (`owner/repo=/path/to/repo`, one per line). Without a path,
    Maestro clones the repository into its data directory.
 
 **Several projects**: the switcher at the top of the sidebar (like GitHub Desktop) lists your saved projects.
-"Add project…" fetches the GitHub projects your token can see (yours and your organizations'). Each project keeps its
-own board, columns, base branch and repo paths (Settings → Project). Only one project is active at a time: switching
+"Add project…" lists the repositories your token can push to (pick several, the first is the primary) or the GitHub
+boards it can see. Each project keeps its own source, labels or columns, base branch and repo paths (Settings →
+Project). Only one project is active at a time: switching
 pauses the engine, and is refused while agents are running.
 
 Then click "Start engine".
@@ -72,9 +85,9 @@ Then click "Start engine".
 ## How it works
 
 ```
-GitHub Project --(polling sync)--> local tickets --> state machine --> Claude Code (one worktree/branch per ticket)
+repo issues / Project board --(polling sync)--> local tickets --> state machine --> Claude Code (one worktree/branch per ticket)
       ^                                                                       |
-      +------------- column status, comments, pull requests, merges <--------+
+      +-------- status labels / columns, comments, pull requests, merges <---+
 ```
 
 ### Ticket states
@@ -106,7 +119,7 @@ Agents are Markdown files in `maestro-data/agents/`, editable from the UI:
 ---
 name: engine
 description: Engine programmer - C++/Rust core systems...   # used by the orchestrator for routing
-role: worker            # worker | orchestrator | reviewer
+role: worker            # worker | orchestrator | reviewer | assistant
 model: sonnet           # opus | sonnet | haiku | full model id
 color: '#4f8cff'
 labels: [engine, rendering]                     # GitHub labels routed directly to this agent
@@ -122,7 +135,9 @@ Claude Code plugin containing only that agent's skills and loads it with `--plug
 There is no limit on the number of agents or skills, and an agent can use any number of skills. The number of
 tickets worked on at the same time is set by "Parallel agents" in Settings.
 
-Default team: `orchestrator`, `engine`, `gamedev`, `gamedesign`, `devops`, `reviewer`.
+Default team: `maestro` (the assistant), `orchestrator`, `engine`, `gamedev`, `gamedesign`, `docs`, `devops`,
+`reviewer`. Defaults added in a new version are copied into `maestro-data` once (files you edited or deleted are
+left alone; `maestro-data/.seeded-defaults` records what was seeded).
 
 ### Several agents on one ticket
 
@@ -149,11 +164,12 @@ Instructions for the lead (delegate) or for every step (pipeline).
 - `pipeline`: the lead, then each member in order, one session each on the same branch. Every step receives the
   summaries of the previous ones. If a step fails, the attempt fails.
 
-Default cells: `gameplay-squad` (delegate) and `feature-pipeline` (gamedesign then gamedev).
+Default cells: `gameplay-squad` (delegate), `feature-pipeline` (gamedesign then gamedev) and `engine-feature`
+(engine then docs).
 
 ### Tickets and the MCP server
 
-Maestro talks to GitHub directly (GraphQL for the project, REST for issues and pull requests). From the UI you can
+Maestro talks to GitHub directly (REST for repositories, issues, labels and pull requests; GraphQL for boards). From the UI you can
 create a ticket ("New ticket" on the board), and close or reopen an issue from the ticket panel. When all
 sub-tickets of a split ticket are done, its issue is closed.
 
@@ -180,6 +196,28 @@ claude mcp add --transport http maestro http://127.0.0.1:7878/mcp \
   --header "Authorization: Bearer <token>"
 ```
 
+### Assistant
+
+The Assistant page is a chat with the `maestro` agent (Settings → Execution picks another one). Each conversation is
+a Claude Code session resumed turn after turn (`--resume`); every turn starts with a snapshot of the live state. The
+assistant cannot edit files or run commands: it acts through the MCP server in **assistant scope**, which adds:
+
+| Tool | Purpose |
+|---|---|
+| `maestro_status` | Active project, engine, counts per state, tickets needing you, running agents, recent failures, cost. |
+| `ticket_details`, `ticket_action` | Everything about a ticket; start, retriage, retry, pause, resume, cancel, reset, assign, helpers, deps, close, reopen, merge. |
+| `create_tickets` | A dependency graph of tickets in one call (like the Planner). |
+| `list_runs`, `get_run_log` | What agents did, and why a run failed. |
+| `engine_control` | Start / pause the engine, sync now. |
+| `list_projects`, `switch_project`, `add_project`, `configure_project` | Maestro projects and their settings (repos, trigger label, base branch, mirror board, limits). |
+| `github_list_repos`, `github_repo_info`, `github_create_repo` | Repositories: list, check push access, create (and watch). |
+| `github_list_projects`, `github_create_project` | GitHub boards: list, create with Maestro's columns, link to repos, attach as mirror or as a new project. |
+| `get_definition`, `save_definition` | Read and edit agents, cells and skills. |
+
+Its skills (`maestro-guide`, `maestro-project-setup`, `maestro-operations`) describe Maestro in detail and tell it to
+confirm before anything outward-facing (creating repositories or boards, merging, closing, switching project).
+To use the same tools from your own Claude Code, add `?scope=assistant` to the MCP URL.
+
 ### Planner
 
 Describe a goal in the Planner page. The orchestrator reads the repository and proposes a set of tickets with
@@ -205,12 +243,14 @@ src/
   main.rs      startup, background loops, HTTP server
   model.rs     types and the state machine (allowed transitions)
   db.rs        SQLite: tickets, dependencies, transitions, runs, logs
-  github.rs    Projects V2 GraphQL and REST (issues, comments, pull requests)
+  github.rs    REST (repositories, issues, labels, comments, pull requests) and Projects V2 GraphQL
+  projects.rs  Maestro projects: switching, repo/board setup, labels
   claude.rs    runs `claude -p --output-format stream-json`, parses events, cancellation
   git.rs       clones, worktrees, push
   engine.rs    sync, scheduler, triage, worker, review, planner
   api.rs       HTTP API, SSE, embedded UI
-  mcp.rs       MCP server (ticket tools)
+  mcp.rs       MCP server (ticket tools, assistant admin tools)
+  chat.rs      assistant conversations (resumed Claude Code sessions)
 web/           index.html, app.js, style.css (plain JS, no build step)
 agents/        default agents (copied to maestro-data on first start)
 cells/         default cells
@@ -234,7 +274,9 @@ mkdir -p /tmp/mtest/remotes/me && git init --bare -b main /tmp/mtest/remotes/me/
 MAESTRO_GITHUB_API=http://127.0.0.1:8787 MAESTRO_GIT_BASE=file:///tmp/mtest/remotes cargo run --release
 ```
 
-In Settings, set the Claude binary to `tests/fake_claude.sh`, any token, owner `me`, project `1`.
+In Settings, set the Claude binary to `tests/fake_claude.sh` and any token, then add the repository `me/game` (repo
+mode) or the board owner `me`, number `1` (project mode). The fake CLI also answers Assistant messages by calling
+the admin tools ("create repo" in the message creates a repository and a mirror board).
 
 ## License
 

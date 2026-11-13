@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 pub struct AgentMeta {
     pub name: String,
     pub description: String,
-    /// orchestrator | worker | reviewer
+    /// orchestrator | worker | reviewer | assistant
     pub role: String,
     pub model: String,
     pub color: String,
@@ -77,6 +77,7 @@ pub struct Skill {
 
 // Defaults shipped inside the binary, written to the data dir on first start.
 const DEFAULT_AGENTS: &[(&str, &str)] = &[
+    ("maestro", include_str!("../agents/maestro.md")),
     ("orchestrator", include_str!("../agents/orchestrator.md")),
     ("engine", include_str!("../agents/engine.md")),
     ("gamedev", include_str!("../agents/gamedev.md")),
@@ -111,6 +112,9 @@ const DEFAULT_SKILLS: &[(&str, &str)] = &[
     ("write-manual", include_str!("../skills/write-manual/SKILL.md")),
     ("verify", include_str!("../skills/verify/SKILL.md")),
     ("xmake-build", include_str!("../skills/xmake-build/SKILL.md")),
+    ("maestro-guide", include_str!("../skills/maestro-guide/SKILL.md")),
+    ("maestro-project-setup", include_str!("../skills/maestro-project-setup/SKILL.md")),
+    ("maestro-operations", include_str!("../skills/maestro-operations/SKILL.md")),
 ];
 
 pub struct Library {
@@ -192,9 +196,44 @@ impl Library {
                 std::fs::create_dir_all(&d)?;
                 std::fs::write(d.join("SKILL.md"), c)?;
             }
-            std::fs::write(seeded, "1")?;
+            std::fs::write(&seeded, "1")?;
         }
+        lib.seed_new_defaults()?;
         Ok(lib)
+    }
+
+    /// Defaults added in a later version are written once (never overwriting a file, and
+    /// not re-created if you delete them afterwards): `.seeded-defaults` records them.
+    fn seed_new_defaults(&self) -> Result<()> {
+        let rec = self.root.join(".seeded-defaults");
+        let mut done: Vec<String> = std::fs::read_to_string(&rec).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let before = done.len();
+        let mut seed = |id: String, path: PathBuf, content: &str| -> Result<()> {
+            if done.contains(&id) {
+                return Ok(());
+            }
+            if !path.exists() {
+                if let Some(p) = path.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                std::fs::write(&path, content)?;
+            }
+            done.push(id);
+            Ok(())
+        };
+        for (n, c) in DEFAULT_AGENTS {
+            seed(format!("agents/{n}"), self.agents_dir().join(format!("{n}.md")), c)?;
+        }
+        for (n, c) in DEFAULT_CELLS {
+            seed(format!("cells/{n}"), self.cells_dir().join(format!("{n}.md")), c)?;
+        }
+        for (n, c) in DEFAULT_SKILLS {
+            seed(format!("skills/{n}"), self.skills_dir().join(n).join("SKILL.md"), c)?;
+        }
+        if done.len() != before {
+            std::fs::write(rec, serde_json::to_string_pretty(&done)?)?;
+        }
+        Ok(())
     }
 
     pub fn agents_dir(&self) -> PathBuf {
@@ -414,9 +453,10 @@ impl Library {
 
 fn role_rank(r: &str) -> u8 {
     match r {
-        "orchestrator" => 0,
-        "reviewer" => 2,
-        _ => 1,
+        "assistant" => 0,
+        "orchestrator" => 1,
+        "reviewer" => 3,
+        _ => 2,
     }
 }
 

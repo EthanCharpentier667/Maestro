@@ -28,6 +28,8 @@ pub struct App {
     pub base_url: String,
     /// ticket id -> number of tickets its agents created through MCP
     pub mcp_created: Mutex<HashMap<i64, usize>>,
+    /// assistant chat id -> run id of the turn in progress
+    pub chat_runs: Mutex<HashMap<i64, i64>>,
 }
 
 pub type AppRef = Arc<App>;

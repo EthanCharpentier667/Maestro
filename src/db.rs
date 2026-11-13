@@ -69,6 +69,19 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE INDEX IF NOT EXISTS logs_run ON logs(run_id);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE INDEX IF NOT EXISTS runs_ticket ON runs(ticket_id);
+CREATE TABLE IF NOT EXISTS chats (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL, session_id TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  cost_usd REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  role TEXT NOT NULL, text TEXT NOT NULL, run_id INTEGER,
+  cost_usd REAL NOT NULL DEFAULT 0, ts TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chat_messages_chat ON chat_messages(chat_id);
 "#;
 
 const TICKET_COLS: &str = "id,item_id,issue_node_id,repo,number,title,body,url,labels,gh_status,gh_state,state,agent,parent,branch,pr_number,pr_url,attempts,review_rounds,feedback,note,cost_usd,updated_at,helpers";
@@ -119,6 +132,14 @@ fn row_run(r: &Row) -> rusqlite::Result<Run> {
         session_id: r.get(9)?,
         summary: r.get(10)?,
     })
+}
+
+fn row_chat(r: &Row) -> rusqlite::Result<Chat> {
+    Ok(Chat { id: r.get(0)?, title: r.get(1)?, session_id: r.get(2)?, created_at: r.get(3)?, updated_at: r.get(4)?, cost_usd: r.get(5)? })
+}
+
+fn row_chat_msg(r: &Row) -> rusqlite::Result<ChatMessage> {
+    Ok(ChatMessage { id: r.get(0)?, chat_id: r.get(1)?, role: r.get(2)?, text: r.get(3)?, run_id: r.get(4)?, cost_usd: r.get(5)?, ts: r.get(6)? })
 }
 
 /// Incoming data from a GitHub sync.
@@ -363,10 +384,14 @@ impl Db {
         removed
     }
 
+    pub fn delete_ticket(&self, id: i64) {
+        let _ = self.conn.lock().execute("DELETE FROM tickets WHERE id=?1", [id]);
+    }
+
     /// Generic patch helper: `field` must be a known column.
     pub fn set_field<T: rusqlite::ToSql>(&self, id: i64, field: &str, v: T) -> Result<()> {
         const OK: &[&str] = &[
-            "agent", "helpers", "parent", "branch", "pr_number", "pr_url", "attempts", "review_rounds", "feedback", "note", "gh_status",
+            "agent", "helpers", "parent", "branch", "pr_number", "pr_url", "attempts", "review_rounds", "feedback", "note", "gh_status", "labels",
         ];
         anyhow::ensure!(OK.contains(&field), "bad field");
         let c = self.conn.lock();
@@ -468,6 +493,66 @@ impl Db {
             .unwrap()
             .filter_map(|x| x.ok())
             .collect()
+    }
+
+    // ---------- assistant chats
+    pub fn chats(&self) -> Vec<Chat> {
+        let c = self.conn.lock();
+        let mut st = c.prepare("SELECT id,title,session_id,created_at,updated_at,cost_usd FROM chats ORDER BY updated_at DESC").unwrap();
+        st.query_map([], row_chat).unwrap().filter_map(|x| x.ok()).collect()
+    }
+
+    pub fn chat(&self, id: i64) -> Option<Chat> {
+        let c = self.conn.lock();
+        c.query_row("SELECT id,title,session_id,created_at,updated_at,cost_usd FROM chats WHERE id=?1", [id], row_chat).optional().ok().flatten()
+    }
+
+    pub fn create_chat(&self, title: &str) -> Result<Chat> {
+        let ts = now();
+        let id = {
+            let c = self.conn.lock();
+            c.execute("INSERT INTO chats(title,created_at,updated_at) VALUES(?1,?2,?2)", params![title, ts])?;
+            c.last_insert_rowid()
+        };
+        self.chat(id).ok_or_else(|| anyhow::anyhow!("chat not created"))
+    }
+
+    pub fn update_chat(&self, id: i64, title: Option<&str>, session: Option<&str>, add_cost: f64) {
+        let c = self.conn.lock();
+        if let Some(t) = title {
+            let _ = c.execute("UPDATE chats SET title=?2 WHERE id=?1", params![id, t]);
+        }
+        if let Some(s) = session {
+            let _ = c.execute("UPDATE chats SET session_id=?2 WHERE id=?1", params![id, s]);
+        }
+        let _ = c.execute("UPDATE chats SET cost_usd=cost_usd+?2, updated_at=?3 WHERE id=?1", params![id, add_cost, now()]);
+    }
+
+    /// Forget the Claude session (next message starts a fresh conversation).
+    pub fn reset_chat_session(&self, id: i64) {
+        let _ = self.conn.lock().execute("UPDATE chats SET session_id=NULL WHERE id=?1", [id]);
+    }
+
+    pub fn delete_chat(&self, id: i64) {
+        let c = self.conn.lock();
+        let _ = c.execute("DELETE FROM chat_messages WHERE chat_id=?1", [id]);
+        let _ = c.execute("DELETE FROM chats WHERE id=?1", [id]);
+    }
+
+    pub fn chat_messages(&self, chat_id: i64) -> Vec<ChatMessage> {
+        let c = self.conn.lock();
+        let mut st = c.prepare("SELECT id,chat_id,role,text,run_id,cost_usd,ts FROM chat_messages WHERE chat_id=?1 ORDER BY id").unwrap();
+        st.query_map([chat_id], row_chat_msg).unwrap().filter_map(|x| x.ok()).collect()
+    }
+
+    pub fn add_chat_message(&self, chat_id: i64, role: &str, text: &str, run_id: Option<i64>, cost: f64) -> Result<ChatMessage> {
+        let c = self.conn.lock();
+        c.execute(
+            "INSERT INTO chat_messages(chat_id,role,text,run_id,cost_usd,ts) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![chat_id, role, text, run_id, cost, now()],
+        )?;
+        let id = c.last_insert_rowid();
+        Ok(c.query_row("SELECT id,chat_id,role,text,run_id,cost_usd,ts FROM chat_messages WHERE id=?1", [id], row_chat_msg)?)
     }
 
     pub fn stats(&self) -> serde_json::Value {

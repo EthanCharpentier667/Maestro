@@ -12,6 +12,33 @@ if [[ "$ARGS" == *'"decision"'* ]]; then
 elif [[ "$ARGS" == *'"approve"'* ]]; then
   if [ -f /tmp/mtest/reject_once ] && [ ! -f /tmp/mtest/rejected ]; then touch /tmp/mtest/rejected; OUT='{"approve":false,"summary":"missing cooldown","issues":["add cooldown constant"]}'
   else OUT='{"approve":true,"summary":"LGTM"}'; fi
+elif [[ "$ARGS" == *"mcp-assistant"* ]]; then
+  # assistant chat turn: call a few admin tools and answer with what they returned
+  CFG=$(printf "%s" "$ARGS" | grep -o -- "--mcp-config [^ ]*" | cut -d" " -f2)
+  RESUMED=no; [[ "$ARGS" == *"--resume"* ]] && RESUMED=yes
+  RESULT=$(python3 - "$CFG" "$PROMPT" "$RESUMED" <<'PY'
+import json, sys, urllib.request
+c = json.load(open(sys.argv[1]))["mcpServers"]["maestro"]; prompt = sys.argv[2]
+def rpc(m, p=None, i=1):
+    r = urllib.request.Request(c["url"], json.dumps({"jsonrpc": "2.0", "id": i, "method": m, "params": p or {}}).encode(), {**c["headers"], "content-type": "application/json"})
+    return json.load(urllib.request.urlopen(r))
+def tool(n, a=None):
+    r = rpc("tools/call", {"name": n, "arguments": a or {}})["result"]
+    return ("ERROR " if r["isError"] else "") + r["content"][0]["text"]
+names = [t["name"] for t in rpc("tools/list")["result"]["tools"]]
+out = {"tools": len(names), "resumed": sys.argv[3], "has_admin": "maestro_status" in names}
+if "create repo" in prompt:
+    out["repo"] = json.loads(tool("github_create_repo", {"name": "space-duel", "watch": True}))
+    out["board"] = json.loads(tool("github_create_project", {"owner": "tester", "title": "Space duel", "link_repos": ["me/game"], "attach": "mirror"}))
+    out["cfg"] = json.loads(tool("configure_project", {"max_parallel": 3}))
+else:
+    st = json.loads(tool("maestro_status"))
+    out["status"] = {"project": st["project"], "source": st["source"], "per_state": st["tickets_per_state"]}
+print(json.dumps(out).replace('"', "'"))
+PY
+)
+  emit '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__maestro__maestro_status","input":{}}]}}'
+  OUT=null; RESULT="**Done.** $RESULT"
 else
   # exercise the Maestro MCP server when asked (FAKE_MCP=1): create a follow-up ticket
   CFG=$(printf "%s" "$ARGS" | grep -o -- "--mcp-config [^ ]*" | cut -d" " -f2)

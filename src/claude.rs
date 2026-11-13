@@ -43,6 +43,8 @@ pub struct Request<'a> {
     pub subagents: Option<std::path::PathBuf>,
     /// `--mcp-config` file (Maestro MCP server for tickets).
     pub mcp: Option<std::path::PathBuf>,
+    /// Continue an existing Claude Code session (assistant chats).
+    pub resume: Option<String>,
 }
 
 pub fn base_command(s: &Settings) -> Command {
@@ -148,6 +150,9 @@ pub async fn run(app: &App, req: Request<'_>) -> Result<Outcome> {
     }
     if s.max_budget_usd > 0.0 {
         cmd.args(["--max-budget-usd", &format!("{:.2}", s.max_budget_usd)]);
+    }
+    if let Some(id) = &req.resume {
+        cmd.args(["--resume", id]);
     }
     if let Some(schema) = &req.json_schema {
         cmd.args(["--json-schema", &schema.to_string()]);

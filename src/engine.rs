@@ -1,5 +1,7 @@
 //! The orchestration engine:
-//!  - sync loop   : GitHub Project ⇄ local tickets (polling, no public webhook needed)
+//!  - sync loop   : GitHub ⇄ local tickets (polling, no public webhook needed). Two sources:
+//!                  repo mode (issues of the watched repos, status in `maestro:*` labels, optional
+//!                  Project mirror) or project mode (a Project V2 board and its Status field)
 //!  - scheduler   : drives every ticket through the state machine
 //!  - triage      : orchestrator agent routes / splits / asks for clarification
 //!  - worker      : specialist agent codes in an isolated worktree → PR
@@ -40,20 +42,78 @@ fn parent_ref(body: &str) -> Option<i64> {
     re.captures(body).and_then(|c| c[1].parse().ok())
 }
 
+/// Reflect a Maestro step on GitHub: a column of the Project (project mode), or a
+/// `maestro:*` label / the trigger label (repo mode, plus the mirror Project if any).
 async fn set_gh_status(app: &App, gh: &Github, t: &Ticket, col: &str) {
     if col.trim().is_empty() || t.gh_status.eq_ignore_ascii_case(col) {
         return;
     }
-    match app.project_info(gh, false).await {
-        Ok(p) => match gh.set_status(&p, &t.item_id, col).await {
-            Ok(_) => {
-                let _ = app.db.set_field(t.id, "gh_status", col);
-                app.emit_ticket(t.id);
-            }
-            Err(e) => app.notice("warn", format!("#{}: cannot set status '{col}': {e}", t.number)),
-        },
-        Err(e) => app.notice("warn", format!("project: {e}")),
+    let s = app.db.settings();
+    let r = if s.repo_mode() { set_repo_status(app, gh, &s, t, Some(col)).await } else { set_project_status(app, gh, &t.item_id, col).await };
+    match r {
+        Ok(_) => {
+            let _ = app.db.set_field(t.id, "gh_status", col);
+            app.emit_ticket(t.id);
+        }
+        Err(e) => app.notice("warn", format!("#{}: cannot set status '{col}': {e:#}", t.number)),
     }
+}
+
+/// Remove every Maestro status from the issue (reopen / back to backlog).
+async fn clear_gh_status(app: &App, gh: &Github, t: &Ticket) {
+    let s = app.db.settings();
+    if s.repo_mode() {
+        if let Err(e) = set_repo_status(app, gh, &s, t, None).await {
+            app.notice("warn", format!("#{}: cannot clear labels: {e:#}", t.number));
+        }
+    }
+    let _ = app.db.set_field(t.id, "gh_status", "");
+    app.emit_ticket(t.id);
+}
+
+async fn set_project_status(app: &App, gh: &Github, item_id: &str, col: &str) -> Result<()> {
+    let p = app.project_info(gh, false).await?;
+    gh.set_status(&p, item_id, col).await
+}
+
+/// repo mode: swap the `maestro:*` status label (or the trigger label for the trigger column).
+async fn set_repo_status(app: &App, gh: &Github, s: &Settings, t: &Ticket, col: Option<&str>) -> Result<()> {
+    let want = col.map(|c| if c.eq_ignore_ascii_case(&s.col_trigger) { s.trigger_label.clone() } else { status_label(c) });
+    let is_status = |l: &str| l.to_lowercase().starts_with(STATUS_LABEL_PREFIX) || l.eq_ignore_ascii_case(&s.trigger_label);
+    // keep the trigger label while working (it says "Maestro owns this issue"); drop it only on clear
+    for l in t.labels.iter().filter(|l| is_status(l)) {
+        let keep = want.as_deref().map(|w| l.eq_ignore_ascii_case(w) || l.eq_ignore_ascii_case(&s.trigger_label)).unwrap_or(false);
+        if !keep {
+            gh.remove_label(&t.repo, t.number, l).await?;
+        }
+    }
+    let mut labels: Vec<String> = t
+        .labels
+        .iter()
+        .filter(|l| !is_status(l) || (want.is_some() && l.eq_ignore_ascii_case(&s.trigger_label)))
+        .cloned()
+        .collect();
+    if let Some(w) = &want {
+        if !labels.iter().any(|l| l.eq_ignore_ascii_case(w)) {
+            gh.add_labels(&t.repo, t.number, &[w.clone()]).await?;
+            labels.push(w.clone());
+        }
+    }
+    app.db.set_field(t.id, "labels", serde_json::to_string(&labels)?)?;
+    // optional mirror board
+    if let (Some(c), true) = (col, s.has_project()) {
+        if !t.issue_node_id.is_empty() {
+            let mirror = async {
+                let p = app.project_info(gh, false).await?;
+                let item = gh.add_to_project(&p.id, &t.issue_node_id).await?;
+                gh.set_status(&p, &item, c).await
+            };
+            if let Err(e) = mirror.await {
+                app.notice("warn", format!("#{}: mirror project: {e:#}", t.number));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn gh_comment(app: &App, gh: &Github, t: &Ticket, body: &str) {
@@ -115,11 +175,76 @@ fn label_agent(app: &App, t: &Ticket) -> Option<String> {
 
 // ───────────────────────────── sync
 
+/// repo mode: open issues of every watched repo, recently closed ones we track, and any
+/// tracked ticket not seen (closed long ago, or living in another repo) fetched one by one.
+async fn repo_items(app: &AppRef, gh: &Github, s: &Settings) -> Result<(Vec<SyncedItem>, Vec<i64>)> {
+    let key = s.project_key();
+    let since = (chrono::Utc::now() - chrono::Duration::days(21)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut items: Vec<SyncedItem> = vec![];
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |mut it: SyncedItem, items: &mut Vec<SyncedItem>| {
+        if seen.insert((it.repo.to_lowercase(), it.number)) {
+            it.item_id = format!("{key}|{}", it.issue_node_id);
+            it.gh_status = s.status_from_labels(&it.labels);
+            items.push(it);
+        }
+    };
+    let repos = s.repo_list();
+    let mut failed = vec![];
+    for repo in &repos {
+        let open = match gh.repo_issues(repo, "open", None, 1000).await {
+            Ok(v) => v,
+            Err(e) => {
+                // one unreachable repository must not stop the others from syncing
+                app.notice("warn", format!("sync: issues of {repo}: {e:#}"));
+                failed.push(format!("{repo}: {e:#}"));
+                continue;
+            }
+        };
+        for it in open {
+            push(it, &mut items);
+        }
+        for it in gh.repo_issues(repo, "closed", Some(&since), 300).await.unwrap_or_default() {
+            if app.db.ticket_by_number(repo, it.number).is_some() {
+                push(it, &mut items);
+            }
+        }
+    }
+    if !repos.is_empty() && failed.len() == repos.len() {
+        anyhow::bail!("{}", failed.join("; "));
+    }
+    let mut gone = vec![];
+    for t in app.db.tickets() {
+        if t.state == State::Done || items.iter().any(|i| i.repo.eq_ignore_ascii_case(&t.repo) && i.number == t.number) {
+            continue;
+        }
+        match gh.issue(&t.repo, t.number).await {
+            Ok(Some(it)) => push(it, &mut items),
+            Ok(None) => gone.push(t.id),
+            Err(e) => app.notice("warn", format!("sync {}#{}: {e:#}", t.repo, t.number)),
+        }
+    }
+    Ok((items, gone))
+}
+
 pub async fn sync_once(app: &AppRef) -> Result<usize> {
     let s = app.db.settings();
+    anyhow::ensure!(s.is_configured(), "No project configured: add repositories (or a GitHub Project) in Settings");
     let gh = app.github().await?;
-    let project = app.project_info(&gh, true).await?;
-    let items = gh.items(&project.id, &s.status_field).await?;
+    let (items, gone) = if s.repo_mode() {
+        if s.has_project() {
+            // refresh the mirror board's metadata (columns) — failure is not fatal
+            if let Err(e) = app.project_info(&gh, true).await {
+                app.notice("warn", format!("mirror project: {e:#}"));
+            }
+        } else {
+            *app.project.lock() = None;
+        }
+        repo_items(app, &gh, &s).await?
+    } else {
+        let project = app.project_info(&gh, true).await?;
+        (gh.items(&project.id, &s.status_field).await?, vec![])
+    };
     let n = items.len();
     let mut keep = vec![];
     let mut fresh: Vec<i64> = vec![];
@@ -145,8 +270,15 @@ pub async fn sync_once(app: &AppRef) -> Result<usize> {
             }
         }
     }
-    for id in app.db.remove_missing(&keep) {
-        app.emit(Event::TicketRemoved { id });
+    if s.repo_mode() {
+        for id in gone {
+            app.db.delete_ticket(id);
+            app.emit(Event::TicketRemoved { id });
+        }
+    } else {
+        for id in app.db.remove_missing(&keep) {
+            app.emit(Event::TicketRemoved { id });
+        }
     }
     // state reactions to GitHub changes
     for t in app.db.tickets() {
@@ -155,11 +287,15 @@ pub async fn sync_once(app: &AppRef) -> Result<usize> {
                 continue;
             }
             app.transition(t.id, State::Done, "issue closed on GitHub");
+            if s.repo_mode() && t.agent.is_some() {
+                set_gh_status(app, &gh, &t, &s.col_done).await;
+            }
             git::cleanup(app, &t).await;
             continue;
         }
         if t.state == State::Backlog && t.gh_state == "OPEN" && t.gh_status.eq_ignore_ascii_case(&s.col_trigger) {
-            app.transition(t.id, State::Triage, &format!("moved to '{}'", s.col_trigger));
+            let why = if s.repo_mode() { format!("labelled '{}'", s.trigger_label) } else { format!("moved to '{}'", s.col_trigger) };
+            app.transition(t.id, State::Triage, &why);
         }
         if t.state == State::AwaitingMerge {
             if let Some(pr) = t.pr_number {
@@ -186,7 +322,7 @@ pub async fn sync_once(app: &AppRef) -> Result<usize> {
 pub async fn sync_loop(app: AppRef) {
     loop {
         let s = app.db.settings();
-        if !s.project_owner.is_empty() && s.project_number > 0 {
+        if s.is_configured() {
             if let Err(e) = sync_once(&app).await {
                 *app.last_sync.lock() = Some((crate::db::now(), Some(e.to_string())));
                 app.notice("warn", format!("sync: {e}"));
@@ -361,7 +497,7 @@ async fn triage(app: &AppRef, id: i64) -> Result<()> {
     );
     let cwd = orchestrator_cwd(app, &t.repo).await;
     let plugin = app.lib.build_plugin(&orch)?;
-    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(triage_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None }).await?;
+    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(triage_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None, resume: None }).await?;
     app.db.add_cost(id, out.cost);
     let fin = app.db.finish_run(run.id, if out.ok { "success" } else { "failed" }, out.cost, out.turns, out.session_id.as_deref(), &out.text);
     if let Some(r) = fin {
@@ -401,17 +537,65 @@ async fn triage(app: &AppRef, id: i64) -> Result<()> {
             let q = d["question"].as_str().unwrap_or(&reason).to_string();
             app.db.set_field(id, "note", format!("Question: {q}"))?;
             app.transition(id, State::NeedsHuman, "orchestrator needs clarification");
-            gh_comment(app, &gh, &t, &format!("🎼 **Maestro** — I need a clarification before routing this:\n\n{q}\n\n_Answer in a comment, then hit **Retriage** in Maestro (or move the card back to '{}')._", s.col_trigger)).await;
+            gh_comment(app, &gh, &t, &format!("🎼 **Maestro** — I need a clarification before routing this:\n\n{q}\n\n_Answer in a comment, then hit **Retriage** in Maestro (or {})._", s.trigger_hint())).await;
         }
     }
     Ok(())
 }
 
+/// Create the GitHub issue behind a new ticket and put it on the board. Returns the
+/// synced item (item id, node id, status) ready for `upsert_synced`.
+async fn open_issue(app: &App, gh: &Github, repo: &str, title: &str, body: &str, mut labels: Vec<String>, start: bool) -> Result<SyncedItem> {
+    let s = app.db.settings();
+    anyhow::ensure!(s.is_configured(), "No project configured (Settings → Project)");
+    let col = if start { s.col_trigger.clone() } else { String::new() };
+    let item_id;
+    let (num, url, node) = if s.repo_mode() {
+        if start {
+            labels.push(s.trigger_label.clone());
+        }
+        let r = gh.create_issue(repo, title, body, &labels).await?;
+        item_id = format!("{}|{}", s.project_key(), r.2);
+        if s.has_project() {
+            let mirror = async {
+                let p = app.project_info(gh, false).await?;
+                let item = gh.add_to_project(&p.id, &r.2).await?;
+                if start {
+                    gh.set_status(&p, &item, &col).await?;
+                }
+                anyhow::Ok(())
+            };
+            if let Err(e) = mirror.await {
+                app.notice("warn", format!("#{}: mirror project: {e:#}", r.0));
+            }
+        }
+        r
+    } else {
+        let project = app.project_info(gh, false).await?;
+        let r = gh.create_issue(repo, title, body, &labels).await?;
+        item_id = gh.add_to_project(&project.id, &r.2).await?;
+        if start {
+            let _ = gh.set_status(&project, &item_id, &col).await;
+        }
+        r
+    };
+    Ok(SyncedItem {
+        item_id,
+        issue_node_id: node,
+        repo: repo.to_string(),
+        number: num,
+        title: title.to_string(),
+        body: body.to_string(),
+        url,
+        labels,
+        gh_status: col,
+        gh_state: "OPEN".into(),
+    })
+}
+
 /// Create GitHub issues for a list of {key,title,body,agent,depends_on}.
 /// Returns [(issue number, agent)].
 pub async fn create_tickets(app: &App, gh: &Github, repo: &str, items: &[Value], parent: Option<&Ticket>, start: bool) -> Result<Vec<(i64, String)>> {
-    let s = app.db.settings();
-    let project = app.project_info(gh, false).await?;
     let mut key_to_id: HashMap<String, i64> = HashMap::new();
     let mut key_to_num: HashMap<String, i64> = HashMap::new();
     let mut out = vec![];
@@ -437,23 +621,9 @@ pub async fn create_tickets(app: &App, gh: &Github, repo: &str, items: &[Value],
         let kind = if app.lib.cell(&agent).is_some() { "cell" } else { "agent" };
         let labels = vec![format!("{kind}:{agent}")];
         let title = it["title"].as_str().unwrap_or("Untitled").to_string();
-        let (num, url, item_id) = gh.create_issue(&project, repo, &title, &body, &labels).await?;
-        let col = if start { s.col_trigger.clone() } else { String::new() };
-        if start {
-            let _ = gh.set_status(&project, &item_id, &col).await;
-        }
-        let (t, _) = app.db.upsert_synced(&SyncedItem {
-            item_id,
-            issue_node_id: String::new(),
-            repo: repo.to_string(),
-            number: num,
-            title,
-            body,
-            url,
-            labels,
-            gh_status: col,
-            gh_state: "OPEN".into(),
-        })?;
+        let item = open_issue(app, gh, repo, &title, &body, labels, start).await?;
+        let num = item.number;
+        let (t, _) = app.db.upsert_synced(&item)?;
         app.db.set_field(t.id, "agent", &agent)?;
         app.db.set_field(t.id, "helpers", serde_json::to_string(&helpers)?)?;
         if let Some(p) = parent {
@@ -493,10 +663,8 @@ pub struct NewTicket {
 }
 
 pub async fn create_one(app: &App, gh: &Github, n: NewTicket) -> Result<Ticket> {
-    let s = app.db.settings();
     anyhow::ensure!(n.repo.contains('/'), "repository must be owner/name");
     anyhow::ensure!(!n.title.trim().is_empty(), "title is empty");
-    let project = app.project_info(gh, false).await?;
     let assignee = n.assignee.filter(|a| !a.is_empty());
     if let Some(a) = &assignee {
         anyhow::ensure!(app.lib.is_assignable(a), "unknown agent or cell '{a}'");
@@ -517,23 +685,8 @@ pub async fn create_one(app: &App, gh: &Github, n: NewTicket) -> Result<Ticket> 
         .iter()
         .map(|a| format!("{}:{a}", if app.lib.cell(a).is_some() { "cell" } else { "agent" }))
         .collect();
-    let (num, url, item_id) = gh.create_issue(&project, &n.repo, &n.title, &body, &labels).await?;
-    let col = if n.start { s.col_trigger.clone() } else { String::new() };
-    if n.start {
-        let _ = gh.set_status(&project, &item_id, &col).await;
-    }
-    let (t, _) = app.db.upsert_synced(&SyncedItem {
-        item_id,
-        issue_node_id: String::new(),
-        repo: n.repo.clone(),
-        number: num,
-        title: n.title.clone(),
-        body,
-        url,
-        labels,
-        gh_status: col,
-        gh_state: "OPEN".into(),
-    })?;
+    let item = open_issue(app, gh, &n.repo, &n.title, &body, labels, n.start).await?;
+    let (t, _) = app.db.upsert_synced(&item)?;
     if let Some(a) = &assignee {
         app.db.set_field(t.id, "agent", a)?;
     }
@@ -585,7 +738,7 @@ pub async fn plan(app: &AppRef, goal: &str, repo: &str) -> Result<Value> {
     );
     let cwd = orchestrator_cwd(app, repo).await;
     let plugin = app.lib.build_plugin(&orch)?;
-    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(plan_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None }).await?;
+    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(plan_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None, resume: None }).await?;
     if let Some(r) = app.db.finish_run(run.id, if out.ok { "success" } else { "failed" }, out.cost, out.turns, out.session_id.as_deref(), &out.text) {
         app.emit(Event::Run { run: r });
     }
@@ -721,7 +874,7 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
             t.number, t.title, t.body, ws.base_ref, ws.base_ref
         );
         let plugin = app.lib.build_plugin(&reviewer)?;
-        let rout = claude::run(app, Request { run_id: rrun.id, cwd: &ws.path, agent: &reviewer, prompt: rprompt, json_schema: Some(review_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None }).await?;
+        let rout = claude::run(app, Request { run_id: rrun.id, cwd: &ws.path, agent: &reviewer, prompt: rprompt, json_schema: Some(review_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None, resume: None }).await?;
         app.db.add_cost(id, rout.cost);
         if let Some(r) = app.db.finish_run(rrun.id, if rout.ok { "success" } else { "failed" }, rout.cost, rout.turns, rout.session_id.as_deref(), &rout.text) {
             app.emit(Event::Run { run: r });
@@ -803,7 +956,7 @@ async fn run_team(app: &App, ticket: i64, team: &Team, cwd: &std::path::Path, pr
         }
         let plugin = app.lib.build_team_plugin(team)?;
         let mcp = crate::mcp::config_for(app, ticket, &team.lead)?;
-        let out = claude::run(app, Request { run_id: run.id, cwd, agent: &team.lead, prompt, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents, mcp }).await?;
+        let out = claude::run(app, Request { run_id: run.id, cwd, agent: &team.lead, prompt, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents, mcp , resume: None }).await?;
         finish(app, ticket, run.id, &out);
         return Ok(out);
     }
@@ -831,7 +984,7 @@ async fn run_team(app: &App, ticket: i64, team: &Team, cwd: &std::path::Path, pr
         app.log(run.id, "system", &format!("pipeline {} · step {}/{}", team.name, i + 1, n));
         let plugin = app.lib.build_plugin(agent)?;
         let mcp = crate::mcp::config_for(app, ticket, agent)?;
-        let out = claude::run(app, Request { run_id: run.id, cwd, agent, prompt: p, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents: None, mcp }).await?;
+        let out = claude::run(app, Request { run_id: run.id, cwd, agent, prompt: p, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents: None, mcp , resume: None }).await?;
         finish(app, ticket, run.id, &out);
         total.cost += out.cost;
         total.turns += out.turns;
@@ -917,6 +1070,12 @@ pub async fn action(app: &AppRef, id: i64, action: &str, body: &Value) -> Result
             app.db.set_field(id, "attempts", 0)?;
             app.db.set_field(id, "review_rounds", 0)?;
             app.transition(id, State::Backlog, "reset by user");
+            // otherwise the trigger label / column would pick it up again at the next sync
+            if let Ok(gh) = app.github().await {
+                if let Some(t) = app.db.ticket(id) {
+                    clear_gh_status(app, &gh, &t).await;
+                }
+            }
         }
         "assign" => {
             let a = body["agent"].as_str().unwrap_or("");
@@ -949,10 +1108,7 @@ pub async fn action(app: &AppRef, id: i64, action: &str, body: &Value) -> Result
             app.db.set_field(id, "attempts", 0)?;
             app.db.set_field(id, "review_rounds", 0)?;
             app.db.set_state(id, t.state, State::Backlog, "reopened from Maestro")?;
-            if let Ok(p) = app.project_info(&gh, false).await {
-                let _ = gh.set_status(&p, &t.item_id, "").await;
-            }
-            app.emit_ticket(id);
+            clear_gh_status(app, &gh, &t).await;
         }
         "merge" => {
             let gh = app.github().await?;

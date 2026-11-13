@@ -3,7 +3,8 @@
 
 const S = { tickets: new Map(), agents: [], skills: [], settings: {}, project: null, stats: {}, sm: { states: [], transitions: [] },
   runs: [], busy: [], lastSync: null, claudeVersion: null, view: 'board', boardMode: 'state', filter: { q: '', repo: '', agent: '' },
-  selRun: null, drawerTicket: null, feed: [], plan: null, planning: false, hideDone: false, graphView: null };
+  selRun: null, drawerTicket: null, feed: [], plan: null, planning: false, hideDone: false, graphView: null,
+  source: { mode: 'repo', repos: [] }, assistant: {}, chats: null, chatId: null, chatMsgs: [], chatBusy: {}, chatLive: [] };
 
 const STATE_LABEL = { backlog: 'Backlog', triage: 'Triage', split: 'Split', blocked: 'Blocked', ready: 'Ready', running: 'Running',
   reviewing: 'Reviewing', awaiting_merge: 'Awaiting merge', done: 'Done', needs_human: 'Needs human', paused: 'Paused' };
@@ -16,6 +17,9 @@ const sc = s => `var(--s-${s})`;
 // ───────── icons (stroke icons, 24×24 grid)
 const ICONS = {
   board: '<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9 4v16M15 4v16"/>',
+  chat: '<path d="M20 12.5a7.5 7.5 0 0 1-11.2 6.5L4 20l1.1-4.3A7.5 7.5 0 1 1 20 12.5z"/><path d="M8.5 11h7M8.5 14.5h4.5"/>',
+  send: '<path d="M4.5 12L20 4.5l-4 15.5-4.2-6.1z"/><path d="M11.8 13.9L20 4.5"/>',
+  repo: '<path d="M6 3.5h11.5a1 1 0 0 1 1 1v13H6.8a2.3 2.3 0 0 0 0 4.6h11.7"/><path d="M6 3.5a2.3 2.3 0 0 0-2.3 2.3v13.9M9 8h6"/>',
   graph: '<circle cx="5.5" cy="6" r="2.5"/><circle cx="5.5" cy="18" r="2.5"/><circle cx="18.5" cy="12" r="2.5"/><path d="M8 6h2.5a3 3 0 0 1 3 3v0a3 3 0 0 0 3 3M8 18h2.5a3 3 0 0 0 3-3v0a3 3 0 0 1 3-3"/>',
   machine: '<rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/><path d="M6.5 10v3.5a3 3 0 0 0 3 3H14M17.5 14v-3.5a3 3 0 0 0-3-3H10"/>',
   planner: '<path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M18.5 15.5l.8 1.9 1.9.8-1.9.8-.8 1.9-.8-1.9-1.9-.8 1.9-.8z"/>',
@@ -176,6 +180,7 @@ async function load() {
   const d = await api('/api/state');
   S.tickets = new Map(d.tickets.map(t => [t.id, t]));
   S.agents = d.agents; S.cells = d.cells || []; S.skills = d.skills; S.settings = d.settings; S.project = d.project; S.projects = d.projects || []; S.activeProject = d.active_project || ''; S.stats = d.stats;
+  S.source = d.source || S.source; S.assistant = d.assistant || {}; S.chatBusy = (d.assistant && d.assistant.busy) || S.chatBusy;
   S.envSecrets = d.env_secrets || []; S.mcp = d.mcp; S.sm = d.statemachine; S.runs = d.runs; S.busy = d.busy; S.lastSync = d.last_sync; S.claudeVersion = d.claude_version;
   renderChrome(); render();
 }
@@ -189,7 +194,10 @@ function connect() {
       case 'ticket_removed': S.tickets.delete(e.id); break;
       case 'transition': S.feed.unshift(e); S.feed = S.feed.slice(0, 80); flashTransition(e); break;
       case 'run': { const i = S.runs.findIndex(r => r.id === e.run.id); if (i >= 0) S.runs[i] = e.run; else S.runs.unshift(e.run); break; }
-      case 'log': appendLog(e.line); return;
+      case 'log': appendLog(e.line); chatLog(e.line); return;
+      case 'chat': onChatMessage(e.message); return;
+      case 'chat_state': onChatState(e.chat_id, e.run_id); return;
+      case 'chats': loadChats(); return;
       case 'notice':
         if (e.level === 'plan') { S.planning = false; S.plan = JSON.parse(e.message).plan; S.planRun = JSON.parse(e.message).run_id; if (S.view === 'planner') render(); toast('Plan ready', 'ok'); return; }
         toast(e.message, e.level); if (e.message.startsWith('planner')) { S.planning = false; if (S.view === 'planner') render(); } break;
@@ -200,11 +208,11 @@ function connect() {
   es.onopen = () => load().catch(() => {});
 }
 let rt = null;
-function scheduleRender() { if (rt) return; rt = setTimeout(() => { rt = null; renderChrome(); if (!['settings', 'agents', 'planner'].includes(S.view) || S.view === 'agents' && !S.editing) render(); }, 120); }
+function scheduleRender() { if (rt) return; rt = setTimeout(() => { rt = null; renderChrome(); if (!['settings', 'agents', 'planner', 'assistant'].includes(S.view) || S.view === 'agents' && !S.editing) render(); }, 120); }
 
 // ───────── chrome (sidebar, top bar)
 const NAV = [
-  ['Workspace', [['board', 'board', 'Board'], ['graph', 'graph', 'Graph'], ['machine', 'machine', 'State machine'], ['planner', 'planner', 'Planner']]],
+  ['Workspace', [['assistant', 'chat', 'Assistant'], ['board', 'board', 'Board'], ['graph', 'graph', 'Graph'], ['machine', 'machine', 'State machine'], ['planner', 'planner', 'Planner']]],
   ['Manage', [['agents', 'agents', 'Agents, cells, skills'], ['runs', 'runs', 'Runs & logs'], ['settings', 'settings', 'Settings']]],
 ];
 const VIEW_TITLE = Object.fromEntries(NAV.flatMap(([, items]) => items.map(([v, , l]) => [v, l])));
@@ -216,7 +224,8 @@ function renderNav() {
   put($('#nav'), NAV.map(([sec, items]) => [h('div', { class: 'nav-sec' }, sec),
     items.map(([v, ic, l]) => h('a', { 'data-view': v, class: S.view === v ? 'active' : '', href: `#${v}` }, icon(ic), l,
       v === 'board' && needs ? h('span', { class: 'nav-badge', title: 'need you' }, needs) : null,
-      v === 'runs' && live ? h('span', { class: 'nav-badge live', title: 'running' }, live) : null))]));
+      v === 'runs' && live ? h('span', { class: 'nav-badge live', title: 'running' }, live) : null,
+      v === 'assistant' && Object.keys(S.chatBusy || {}).length ? h('span', { class: 'nav-badge live', title: 'answering' }, h('span', { class: 'spin' })) : null))]));
 }
 
 function renderChrome() {
@@ -226,9 +235,14 @@ function renderChrome() {
   const count = s => ts.filter(t => t.state === s).length;
   $('#page-title').textContent = VIEW_TITLE[S.view] || '';
   document.title = `${VIEW_TITLE[S.view] || 'Maestro'} · Maestro`;
-  put($('#proj'), S.project
-    ? [h('span', {}, S.project.title), h('a', { href: S.project.url, target: '_blank', rel: 'noopener', title: 'Open on GitHub' }, icon('external', 'xs'), 'GitHub')]
-    : h('span', {}, 'No project — open Settings'));
+  const repos = S.source?.mode === 'repo' ? (S.source.repos || []) : [];
+  put($('#proj'), repos.length
+    ? [repos.slice(0, 3).map(r => h('a', { href: `https://github.com/${r}/issues`, target: '_blank', rel: 'noopener', title: 'Open the issues on GitHub' }, icon('repo', 'xs'), r)),
+      repos.length > 3 ? h('span', {}, `+${repos.length - 3}`) : null,
+      S.project ? h('a', { href: S.project.url, target: '_blank', rel: 'noopener', title: 'Mirror board' }, icon('board', 'xs'), S.project.title) : null]
+    : S.project
+      ? [h('span', {}, S.project.title), h('a', { href: S.project.url, target: '_blank', rel: 'noopener', title: 'Open on GitHub' }, icon('external', 'xs'), 'GitHub')]
+      : h('span', {}, 'No project — add one from the switcher or ask the Assistant'));
   const needs = count('needs_human');
   put($('#kpis'),
     h('span', { class: 'kpi opt' }, h('b', {}, ts.length), 'tickets'),
@@ -282,7 +296,7 @@ $('#nav').onclick = e => { const a = e.target.closest('a'); if (!a) return; e.pr
 
 function render() {
   const v = $('#view');
-  const fn = { board: viewBoard, graph: viewGraph, machine: viewMachine, planner: viewPlanner, agents: viewAgents, runs: viewRuns, settings: viewSettings }[S.view];
+  const fn = { assistant: viewAssistant, board: viewBoard, graph: viewGraph, machine: viewMachine, planner: viewPlanner, agents: viewAgents, runs: viewRuns, settings: viewSettings }[S.view];
   const keepScroll = v.scrollTop;
   const active = document.activeElement, keepId = active && v.contains(active) ? active.id : null;
   put(v, fn());
@@ -325,16 +339,17 @@ function ticketCard(t) {
 }
 function viewBoard() {
   const ts = filtered();
-  if (!S.project && !ts.length) return onboarding();
+  if (!activeProject() && !ts.length) return onboarding();
   let cols;
   if (S.boardMode === 'github') {
-    const names = S.project?.options?.map(o => o[1]) || [...new Set(ts.map(t => t.gh_status))];
+    const st = S.settings, repoCols = [st.col_trigger, st.col_in_progress, st.col_review, st.col_done].filter(Boolean);
+    const names = S.project?.options?.map(o => o[1]) || (S.source?.mode === 'repo' ? repoCols : [...new Set(ts.map(t => t.gh_status))]);
     cols = [...names, ''].map(n => [n || 'No status', ts.filter(t => (t.gh_status || '') === n), null]);
   } else cols = BOARD_COLS.map(([n, st]) => [n, ts.filter(t => st.includes(t.state)), st[0]]);
   return h('div', { class: 'fill' },
     filterBar([h('div', { class: 'seg' },
       h('button', { type: 'button', class: S.boardMode === 'state' ? 'on' : '', onclick: () => { S.boardMode = 'state'; render(); } }, 'Maestro states'),
-      h('button', { type: 'button', class: S.boardMode === 'github' ? 'on' : '', onclick: () => { S.boardMode = 'github'; render(); } }, icon('github', 'sm'), 'GitHub columns')),
+      h('button', { type: 'button', class: S.boardMode === 'github' ? 'on' : '', onclick: () => { S.boardMode = 'github'; render(); } }, icon('github', 'sm'), S.source?.mode === 'repo' && !S.project ? 'GitHub labels' : 'GitHub columns')),
     h('span', { class: 'spacer' }),
     btn('plus', 'New ticket', { class: 'btn primary', onclick: () => newTicket() })]),
     h('div', { class: 'board' }, cols.map(([name, list, st]) => h('div', { class: 'col' },
@@ -345,15 +360,16 @@ function onboarding() {
   return h('div', { class: 'card onboard hero' },
     h('span', { class: 'logo', style: 'width:44px;height:44px;border-radius:12px' }, h('svg:svg', { viewBox: '0 0 24 24', style: 'width:26px;height:26px' }, h('svg:path', { d: 'M5 17V7l7 7 7-7v10' }))),
     h('h2', {}, 'Welcome to Maestro'),
-    h('p', {}, 'Orchestrate a team of Claude Code agents from a GitHub Project. Four steps to get going:'),
+    h('p', {}, 'Orchestrate a team of Claude Code agents on your GitHub repositories. Four steps to get going — or just ask the Assistant to set it up for you.'),
     h('ol', { class: 'steps' },
-      h('li', {}, h('div', {}, h('b', {}, 'GitHub access. '), 'In Settings, add a token (scopes ', h('code', {}, 'repo'), ' + ', h('code', {}, 'project'), ') or use the ', h('code', {}, 'gh'), ' CLI. Then pick a project with the switcher (top left).')),
+      h('li', {}, h('div', {}, h('b', {}, 'GitHub access. '), 'In Settings, add a token (scope ', h('code', {}, 'repo'), ', plus ', h('code', {}, 'project'), ' for GitHub boards) or use the ', h('code', {}, 'gh'), ' CLI. Then add your repositories with the switcher (top left).')),
       h('li', {}, h('div', {}, h('b', {}, 'Claude Code. '), '“Account” uses your local ', h('code', {}, 'claude'), ' login (Pro/Max). Or paste a token from ', h('code', {}, 'claude setup-token'), '.')),
       h('li', {}, h('div', {}, h('b', {}, 'Your team. '), 'Tune the agents in Agents, cells, skills (orchestrator, engine, gamedev, gamedesign…).')),
-      h('li', {}, h('div', {}, h('b', {}, 'Go. '), 'Move a card to the trigger column (“Todo” by default) or use the Planner, then ', h('b', {}, 'start the engine'), '.'))),
+      h('li', {}, h('div', {}, h('b', {}, 'Go. '), 'Label an issue ', h('code', {}, S.settings.trigger_label || 'maestro'), ' (or move a card to the trigger column of a board), use the Planner or the Assistant, then ', h('b', {}, 'start the engine'), '.'))),
     h('div', { class: 'row-btns' },
-      btn('settings', 'Open settings', { class: 'btn primary', onclick: () => go('settings') }),
-      btn('plus', 'Add a GitHub project', { onclick: openProjectPicker })));
+      btn('chat', 'Ask the Assistant', { class: 'btn primary', onclick: () => go('assistant') }),
+      btn('plus', 'Add repositories', { onclick: () => openProjectPicker('repo') }),
+      btn('settings', 'Open settings', { onclick: () => go('settings') })));
 }
 
 // ───────── TICKET DRAWER
@@ -446,7 +462,7 @@ function newTicket() {
   put($('#drawer-inner'),
     h('div', { class: 'dw-head' }, icon('plus', 'sm'), h('b', {}, 'New ticket'), h('span', { class: 'grow' }), h('button', { class: 'icon-btn sm', type: 'button', title: 'Close (Esc)', onclick: closeDrawer }, icon('x'))),
     h('div', { class: 'dw-body' },
-      h('p', { class: 'muted', style: 'margin:0 0 18px' }, 'Creates a GitHub issue and adds it to the project.'),
+      h('p', { class: 'muted', style: 'margin:0 0 18px' }, S.source?.mode === 'repo' ? 'Creates a GitHub issue in the repository (queued = labelled for Maestro).' : 'Creates a GitHub issue and adds it to the project.'),
       h('label', { class: 'f' }, h('span', {}, 'Repository'), h('input', { list: 'nt-repos', value: f.repo, placeholder: 'owner/repo', oninput: e => f.repo = e.target.value }), h('datalist', { id: 'nt-repos' }, repos.map(r => h('option', { value: r })))),
       h('label', { class: 'f' }, h('span', {}, 'Title'), h('input', { placeholder: 'Short, imperative summary', autofocus: true, oninput: e => f.title = e.target.value })),
       h('label', { class: 'f' }, h('span', {}, 'Description'), h('textarea', { class: 'prose', rows: 9, placeholder: 'Markdown. Context, acceptance criteria…', oninput: e => f.body = e.target.value })),
@@ -455,7 +471,7 @@ function newTicket() {
           h('label', { class: 'f' }, h('span', {}, 'Assigned to'), h('select', { onchange: e => f.agent = e.target.value }, assigneeOptions('', '— orchestrator decides —'))),
           h('label', { class: 'f' }, h('span', {}, 'Helpers'), h('select', { multiple: true, size: 3, onchange: e => f.helpers = [...e.target.selectedOptions].map(o => o.value) }, workersList().map(a => h('option', { value: a.name }, a.name))))),
         h('label', { class: 'f' }, h('span', {}, 'Depends on'), h('select', { multiple: true, size: 7, onchange: e => f.deps = [...e.target.selectedOptions].map(o => +o.value) }, others.map(o => h('option', { value: o.id }, `#${o.number} ${o.title.slice(0, 50)}`))))),
-      h('label', { class: 'switch' }, h('input', { type: 'checkbox', onchange: e => f.start = e.target.checked }), h('span', { class: 'track' }), 'Queue now (put it in the trigger column)'),
+      h('label', { class: 'switch' }, h('input', { type: 'checkbox', onchange: e => f.start = e.target.checked }), h('span', { class: 'track' }), S.source?.mode === 'repo' ? `Queue now (label it ${S.settings.trigger_label || 'maestro'})` : 'Queue now (put it in the trigger column)'),
       h('div', { class: 'actions' },
         btn('plus', 'Create issue', { class: 'btn primary', onclick: () => act(async () => { const t = await api('/api/tickets', { method: 'POST', body: f }); S.tickets.set(t.id, t); openTicket(t.id); render(); }, 'Issue created') }),
         h('button', { class: 'btn ghost', type: 'button', onclick: closeDrawer }, 'Cancel'))));
@@ -774,6 +790,11 @@ function repoChoices() {
 
 // ───────── PROJECTS (switcher, like GitHub Desktop)
 const activeProject = () => (S.projects || []).find(p => p.key === S.activeProject);
+const profileRepos = p => String(p.repos || '').split(/[\s,]+/).filter(r => r.includes('/'));
+function projectSubtitle(p) {
+  if (p.source !== 'project' && profileRepos(p).length) { const r = profileRepos(p); return r[0] + (r.length > 1 ? ` +${r.length - 1}` : '') + (p.project_number > 0 ? ' · board' : ''); }
+  return `${p.project_owner} · board #${p.project_number}`;
+}
 
 function renderProjectSwitcher() {
   const cur = activeProject();
@@ -791,12 +812,13 @@ function toggleProjectMenu() {
   if (document.querySelector('.proj-menu')) return closeProjectMenu();
   const items = (S.projects || []).map(p => h('div', { class: 'pm-item' + (p.key === S.activeProject ? ' on' : ''), onclick: () => { closeProjectMenu(); if (p.key !== S.activeProject) switchProject(p.key); } },
     h('span', { class: 'pm-check' }, p.key === S.activeProject ? icon('check', 'sm') : null),
-    h('span', { class: 'pm-name' }, h('b', {}, p.name), h('small', {}, `${p.project_owner} · #${p.project_number}`))));
+    h('span', { class: 'pm-name' }, h('b', {}, p.name), h('small', {}, projectSubtitle(p)))));
   const menu = h('div', { class: 'proj-menu', role: 'menu', onclick: e => e.stopPropagation() },
     h('div', { class: 'pm-label' }, 'Projects'),
     items.length ? items : h('div', { class: 'pm-empty' }, 'No project yet'),
     h('div', { class: 'pm-sep' }),
     h('div', { class: 'pm-item', onclick: () => { closeProjectMenu(); openProjectPicker(); } }, h('span', { class: 'pm-check' }, icon('plus', 'sm')), h('span', { class: 'pm-name' }, h('b', {}, 'Add project…'))),
+    h('div', { class: 'pm-item', onclick: () => { closeProjectMenu(); go('assistant'); } }, h('span', { class: 'pm-check' }, icon('chat', 'sm')), h('span', { class: 'pm-name' }, h('b', {}, 'Create with the Assistant…'))),
     h('div', { class: 'pm-item', onclick: () => { closeProjectMenu(); goSettings('project'); } }, h('span', { class: 'pm-check' }, icon('settings', 'sm')), h('span', { class: 'pm-name' }, h('b', {}, 'Project settings'))));
   $('#proj-switch').append(menu);
 }
@@ -815,41 +837,299 @@ async function switchProject(key) {
   toast(`Switched to ${activeProject()?.name || key} — engine paused`, 'ok');
 }
 
-async function openProjectPicker() {
+async function openProjectPicker(tab = 'repo') {
   const known = new Set((S.projects || []).map(p => p.key));
-  const st = { list: null, q: '', err: '', owner: '', number: '' };
+  const st = { tab, repos: null, boards: null, q: '', err: '', sel: [], name: '', owner: '', number: '', manual: '' };
   const body = h('div', {});
   let close = () => {};
-  const add = async (owner, number, title) => {
-    const r = await act(() => api('/api/projects/add', { method: 'POST', body: { owner, number: +number, title } }));
-    if (!r) return;
-    close(); S.draft = null; S.filter.repo = ''; await load();
-    toast(`Switched to ${activeProject()?.name || owner}`, 'ok');
+  const done = async r => { if (!r) return; close(); S.draft = null; S.filter.repo = ''; S.repoList = null; await load(); toast(`Switched to ${activeProject()?.name || 'the new project'} — engine paused`, 'ok'); };
+  const addRepos = () => {
+    const repos = [...st.sel, ...st.manual.split(/[\s,]+/).filter(r => r.includes('/'))];
+    if (!repos.length) return toast('Pick at least one repository', 'warn');
+    return act(() => api('/api/projects/add', { method: 'POST', body: { kind: 'repo', repos, name: st.name } })).then(done);
   };
+  const addBoard = (owner, number, title) => act(() => api('/api/projects/add', { method: 'POST', body: { owner, number: +number, title } })).then(done);
+  const fetchTab = async () => {
+    st.err = '';
+    try {
+      if (st.tab === 'repo' && st.repos === null) st.repos = await api('/api/github/repos');
+      if (st.tab === 'project' && st.boards === null) st.boards = await api('/api/github/projects');
+    } catch (e) { st.err = e.message; if (st.tab === 'repo') st.repos = []; else st.boards = []; }
+    draw();
+  };
+  const filterInput = placeholder => h('div', { class: 'search', style: 'display:flex' }, icon('search', 'sm'),
+    h('input', { placeholder, value: st.q, autofocus: true, oninput: e => { st.q = e.target.value; draw(); const i = body.querySelector('.search input'); i.focus(); i.setSelectionRange(99, 99); } }));
+  const loading = list => list === null ? h('div', { class: 'muted pp-note' }, st.err ? '' : [h('span', { class: 'spin' }), 'Loading from GitHub…']) : null;
+  const errBox = () => st.err ? h('div', { class: 'pp-note', style: 'color:var(--err)' }, icon('alert', 'sm'), st.err) : null;
   const draw = () => {
     const q = st.q.toLowerCase();
-    const list = (st.list || []).filter(p => !q || `${p.owner} ${p.title}`.toLowerCase().includes(q));
-    put(body,
-      h('div', { class: 'search', style: 'display:flex' }, icon('search', 'sm'),
-        h('input', { placeholder: 'Filter your GitHub projects…', value: st.q, autofocus: true, oninput: e => { st.q = e.target.value; draw(); const i = body.querySelector('input'); i.focus(); i.setSelectionRange(99, 99); } })),
-      h('div', { class: 'pp-list' },
-        st.list === null ? h('div', { class: 'muted pp-note' }, st.err ? '' : [h('span', { class: 'spin' }), 'Loading from GitHub…']) : null,
-        st.err ? h('div', { class: 'pp-note', style: 'color:var(--err)' }, icon('alert', 'sm'), st.err) : null,
-        list.map(p => h('div', { class: 'pm-item' + (known.has(`${p.owner.toLowerCase()}/${p.number}`) ? ' dim' : ''), onclick: () => add(p.owner, p.number, p.title) },
-          h('span', { class: 'ps-ico', style: 'width:28px;height:28px' }, initial(p.title)),
-          h('span', { class: 'pm-name' }, h('b', {}, p.title), h('small', {}, `${p.owner} · #${p.number}${p.description ? ' — ' + p.description : ''}`)),
-          known.has(`${p.owner.toLowerCase()}/${p.number}`) ? h('span', { class: 'pill' }, 'added') : null)),
-        st.list && !list.length ? h('div', { class: 'muted pp-note' }, 'Nothing matches.') : null),
-      h('details', { class: 'pp-manual' }, h('summary', {}, 'Not listed? Enter it manually'),
-        h('div', { class: 'grid2', style: 'margin-top:10px' },
-          h('label', { class: 'f' }, h('span', {}, 'Owner (user or org)'), h('input', { value: st.owner, oninput: e => st.owner = e.target.value })),
-          h('label', { class: 'f' }, h('span', {}, 'Project number'), h('input', { type: 'number', value: st.number, oninput: e => st.number = e.target.value }))),
-        btn('plus', 'Add project', { class: 'btn primary', onclick: () => add(st.owner, st.number) })));
+    const tabs = h('div', { class: 'seg', style: 'margin-bottom:12px' },
+      h('button', { type: 'button', class: st.tab === 'repo' ? 'on' : '', onclick: () => { st.tab = 'repo'; st.q = ''; draw(); fetchTab(); } }, icon('repo', 'sm'), 'Repositories'),
+      h('button', { type: 'button', class: st.tab === 'project' ? 'on' : '', onclick: () => { st.tab = 'project'; st.q = ''; draw(); fetchTab(); } }, icon('board', 'sm'), 'GitHub Project board'));
+    if (st.tab === 'repo') {
+      const list = (st.repos || []).filter(r => !q || r.toLowerCase().includes(q));
+      put(body, tabs,
+        h('p', { class: 'small muted', style: 'margin:0 0 10px' }, 'Maestro watches the open issues of these repositories. An issue labelled ', h('code', {}, S.settings.trigger_label || 'maestro'), ' is picked up; progress is shown with ', h('code', {}, 'maestro:*'), ' labels. The first one is the primary repository.'),
+        filterInput('Filter your repositories…'),
+        h('div', { class: 'pp-list' }, loading(st.repos), errBox(),
+          list.slice(0, 200).map(r => {
+            const i = st.sel.indexOf(r);
+            return h('div', { class: 'pm-item' + (i >= 0 ? ' on' : '') + (known.has(`repo:${r.toLowerCase()}`) ? ' dim' : ''), onclick: () => { if (i >= 0) st.sel.splice(i, 1); else st.sel.push(r); draw(); } },
+              h('span', { class: 'pm-check' }, i >= 0 ? (i === 0 ? h('span', { class: 'pill', title: 'primary' }, '1') : icon('check', 'sm')) : null),
+              h('span', { class: 'pm-name' }, h('b', {}, r)),
+              known.has(`repo:${r.toLowerCase()}`) ? h('span', { class: 'pill' }, 'project exists') : null);
+          }),
+          st.repos && !list.length ? h('div', { class: 'muted pp-note' }, 'Nothing matches.') : null),
+        h('div', { class: 'grid2', style: 'margin-top:12px' },
+          h('label', { class: 'f' }, h('span', {}, 'Other repositories (owner/name)'), h('input', { value: st.manual, placeholder: 'acme/engine, acme/game', oninput: e => st.manual = e.target.value })),
+          h('label', { class: 'f' }, h('span', {}, 'Project name (optional)'), h('input', { value: st.name, placeholder: 'My game', oninput: e => st.name = e.target.value }))),
+        h('div', { class: 'row-btns', style: 'justify-content:space-between;align-items:center' },
+          h('span', { class: 'small muted' }, st.sel.length ? `${st.sel.length} selected — primary: ${st.sel[0]}` : 'Click to select, in order of importance.'),
+          btn('plus', 'Add project', { class: 'btn primary', onclick: addRepos })),
+        h('p', { class: 'small muted', style: 'margin:12px 0 0' }, 'Need a new repository or a GitHub board? ', h('a', { href: '#assistant', onclick: e => { e.preventDefault(); close(); go('assistant'); } }, 'Ask the Assistant'), ' — it can create and wire them.'));
+    } else {
+      const list = (st.boards || []).filter(p => !q || `${p.owner} ${p.title}`.toLowerCase().includes(q));
+      put(body, tabs,
+        h('p', { class: 'small muted', style: 'margin:0 0 10px' }, 'The board is the source of truth: cards moved to the trigger column are picked up. Needs the token scope ', h('code', {}, 'project'), '. (To keep repositories as the source and only show a board, attach it as a mirror in Settings → Project.)'),
+        filterInput('Filter your GitHub projects…'),
+        h('div', { class: 'pp-list' }, loading(st.boards), errBox(),
+          list.map(p => h('div', { class: 'pm-item' + (known.has(`${p.owner.toLowerCase()}/${p.number}`) ? ' dim' : ''), onclick: () => addBoard(p.owner, p.number, p.title) },
+            h('span', { class: 'ps-ico', style: 'width:28px;height:28px' }, initial(p.title)),
+            h('span', { class: 'pm-name' }, h('b', {}, p.title), h('small', {}, `${p.owner} · #${p.number}${p.description ? ' — ' + p.description : ''}`)),
+            known.has(`${p.owner.toLowerCase()}/${p.number}`) ? h('span', { class: 'pill' }, 'added') : null)),
+          st.boards && !list.length ? h('div', { class: 'muted pp-note' }, 'Nothing matches.') : null),
+        h('details', { class: 'pp-manual' }, h('summary', {}, 'Not listed? Enter it manually'),
+          h('div', { class: 'grid2', style: 'margin-top:10px' },
+            h('label', { class: 'f' }, h('span', {}, 'Owner (user or org)'), h('input', { value: st.owner, oninput: e => st.owner = e.target.value })),
+            h('label', { class: 'f' }, h('span', {}, 'Project number'), h('input', { type: 'number', value: st.number, oninput: e => st.number = e.target.value }))),
+          btn('plus', 'Add project', { class: 'btn primary', onclick: () => addBoard(st.owner, st.number) })));
+    }
   };
-  close = openModal({ title: 'Add a GitHub project', desc: 'Switching pauses the engine. Each project keeps its own board, columns and repo paths.', body });
+  close = openModal({ title: 'Add a project', desc: 'Switching pauses the engine. Each project keeps its own board, settings and tickets.', body, width: 620 });
   draw();
-  try { st.list = await api('/api/github/projects'); } catch (e) { st.list = []; st.err = e.message; }
-  draw();
+  fetchTab();
+}
+
+// ───────── MARKDOWN (assistant answers) — escapes everything, then a small safe subset
+const escHtml = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+function mdInline(src) {
+  return String(src).split(/(`[^`\n]+`)/).map(part => {
+    if (/^`[^`]+`$/.test(part)) return `<code>${escHtml(part.slice(1, -1))}</code>`;
+    return escHtml(part)
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+      .replace(/(^|[\s(])(https?:\/\/[^\s<)]+[^\s<).,;:!?'"])/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>')
+      .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+      .replace(/(^|[^\w*])\*([^*\n]+)\*(?!\w)/g, '$1<i>$2</i>')
+      .replace(/(^|[^\w])_([^_\n]+)_(?!\w)/g, '$1<i>$2</i>')
+      .replace(/~~([^~\n]+)~~/g, '<s>$1</s>');
+  }).join('');
+}
+function mdToHtml(src) {
+  const lines = String(src || '').replace(/\r/g, '').split('\n');
+  const out = [];
+  const isList = l => /^\s*([-*+]|\d+[.)])\s+/.test(l);
+  const isTable = (l, n) => /^\s*\|.*\|\s*$/.test(l) && n != null && /^\s*\|?\s*:?-{2,}/.test(n);
+  const cells = l => l.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+  for (let i = 0; i < lines.length;) {
+    const l = lines[i];
+    if (/^\s*```/.test(l)) {
+      const buf = []; i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
+      i++; out.push(`<pre><code>${escHtml(buf.join('\n'))}</code></pre>`); continue;
+    }
+    if (!l.trim()) { i++; continue; }
+    let m;
+    if ((m = l.match(/^(#{1,4})\s+(.*)$/))) { const n = Math.min(m[1].length + 2, 6); out.push(`<h${n}>${mdInline(m[2])}</h${n}>`); i++; continue; }
+    if (/^\s*(---|\*\*\*)\s*$/.test(l)) { out.push('<hr>'); i++; continue; }
+    if (isTable(l, lines[i + 1])) {
+      const head = cells(l); i += 2; const rows = [];
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) rows.push(cells(lines[i++]));
+      out.push(`<div class="md-table"><table><tr>${head.map(c => `<th>${mdInline(c)}</th>`).join('')}</tr>${rows.map(r => `<tr>${r.map(c => `<td>${mdInline(c)}</td>`).join('')}</tr>`).join('')}</table></div>`);
+      continue;
+    }
+    if (isList(l)) {
+      const ordered = /^\s*\d/.test(l), items = [];
+      while (i < lines.length && ((isList(lines[i]) && /^\s*\d/.test(lines[i]) === ordered) || (/^\s{2,}\S/.test(lines[i]) && !isList(lines[i]) && items.length))) {
+        if (isList(lines[i])) items.push(lines[i].replace(/^\s*([-*+]|\d+[.)])\s+/, '')); else items[items.length - 1] += ' ' + lines[i].trim();
+        i++;
+      }
+      const li = items.map(t => { const c = t.match(/^\[( |x|X)\]\s+(.*)$/); return c ? `<li class="task">${c[1] === ' ' ? '☐' : '☑'} ${mdInline(c[2])}</li>` : `<li>${mdInline(t)}</li>`; }).join('');
+      out.push(ordered ? `<ol>${li}</ol>` : `<ul>${li}</ul>`); continue;
+    }
+    if (/^\s*>/.test(l)) {
+      const buf = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ''));
+      out.push(`<blockquote>${mdToHtml(buf.join('\n'))}</blockquote>`); continue;
+    }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !/^\s*```/.test(lines[i]) && !/^#{1,4}\s/.test(lines[i]) && !isList(lines[i]) && !isTable(lines[i], lines[i + 1]) && !/^\s*>/.test(lines[i])) buf.push(lines[i++]);
+    out.push(`<p>${buf.map(mdInline).join('<br>')}</p>`);
+  }
+  return out.join('');
+}
+const md = (text, cls = '') => h('div', { class: `md ${cls}`, html: mdToHtml(text) });
+
+// ───────── ASSISTANT (chat with the maestro agent)
+const CHAT_SUGGESTIONS = [
+  ['Where are we?', 'Where are we on the project? What needs me right now?'],
+  ['Set up a new game', 'I want to start a new game on the AYLO engine: create a private repository for it, watch it together with the engine repository, and add a GitHub board mirrored from the labels. Tell me the plan before doing anything.'],
+  ['Plan a feature', 'Plan this feature into tickets for the team: '],
+  ['Why is it stuck?', 'Which tickets are blocked or failed, and why? Propose how to unblock each one.'],
+  ['How does Maestro work?', 'Explain how Maestro works: where tickets come from, the states, and what each agent does.'],
+];
+async function loadChats() {
+  try {
+    const r = await api('/api/chats');
+    S.chats = r.chats; S.chatBusy = r.busy || {};
+    if (S.view === 'assistant') { renderChatList(); renderChatHead(); renderChatInput(); }
+    renderNav();
+  } catch (e) { /* offline */ }
+}
+async function openChat(id) {
+  S.chatId = id; S.chatLive = [];
+  try { localStorage.setItem('maestro-chat', String(id)); } catch (e) { /* storage unavailable */ }
+  const d = await api(`/api/chats/${id}`).catch(e => { toast(e.message, 'error'); return null; });
+  if (!d) { S.chatId = null; S.chatMsgs = []; return refreshChat(); }
+  S.chatMsgs = d.messages;
+  if (d.run_id) {
+    S.chatBusy[id] = d.run_id;
+    const logs = await api(`/api/runs/${d.run_id}/logs`).catch(() => []);
+    S.chatLive = logs.filter(l => ['tool', 'text', 'error'].includes(l.kind));
+  }
+  refreshChat(true);
+}
+async function newChat() {
+  const c = await act(() => api('/api/chats', { method: 'POST', body: {} }));
+  if (!c) return null;
+  (S.chats ||= []).unshift(c);
+  await openChat(c.id);
+  $('#chat-text')?.focus();
+  return c.id;
+}
+async function sendChat(text) {
+  text = (text ?? $('#chat-text')?.value ?? '').trim();
+  if (!text) return;
+  if (!S.chatId && !(await newChat())) return;
+  const box = $('#chat-text'); if (box) box.value = '';
+  S.chatDraft = '';
+  const r = await act(() => api(`/api/chats/${S.chatId}/messages`, { method: 'POST', body: { text } }));
+  if (!r) { if (box) box.value = text; return; }
+  onChatMessage(r.message);
+  onChatState(S.chatId, r.run_id);
+}
+function onChatMessage(m) {
+  if (m.chat_id !== S.chatId) return;
+  if (S.chatMsgs.some(x => x.id === m.id)) return;
+  S.chatMsgs.push(m);
+  if (m.role !== 'user') S.chatLive = [];
+  if (S.view === 'assistant') renderChatThread(true);
+}
+function onChatState(chatId, runId) {
+  if (runId) S.chatBusy[chatId] = runId; else delete S.chatBusy[chatId];
+  if (chatId === S.chatId && runId) S.chatLive = [];
+  renderNav();
+  if (S.view === 'assistant') { renderChatList(); if (chatId === S.chatId) { renderChatThread(true); renderChatInput(); } }
+}
+function chatLog(l) {
+  if (!S.chatId || S.chatBusy[S.chatId] !== l.run_id || !['tool', 'text', 'error'].includes(l.kind)) return;
+  S.chatLive.push(l);
+  if (S.view === 'assistant') renderChatLive();
+}
+const prettyTool = t => t.replace(/^mcp__maestro__/, '').replace(/ · \{\}$/, '');
+function liveBox() {
+  const tools = S.chatLive.filter(l => l.kind === 'tool');
+  const lastText = [...S.chatLive].reverse().find(l => l.kind === 'text');
+  return h('div', { class: 'msg assistant live', id: 'chat-live' },
+    h('div', { class: 'msg-av' }, icon('chat', 'sm')),
+    h('div', { class: 'msg-body' },
+      h('div', { class: 'live-h' }, h('span', { class: 'spin' }), tools.length ? `Working · ${tools.length} tool call${tools.length > 1 ? 's' : ''}` : 'Thinking…'),
+      tools.length ? h('div', { class: 'live-tools' }, tools.slice(-6).map(t => h('div', { class: 'lt' }, icon('bolt', 'xs'), prettyTool(t.text)))) : null,
+      lastText ? md(lastText.text, 'dim') : null));
+}
+function renderChatLive() {
+  const el = $('#chat-live'); if (!el) return renderChatThread(true);
+  const th = $('#chat-thread'); const stick = th && th.scrollHeight - th.scrollTop - th.clientHeight < 80;
+  el.replaceWith(liveBox());
+  if (stick && th) th.scrollTop = th.scrollHeight;
+}
+function chatMessage(m) {
+  if (m.role === 'system') return h('div', { class: 'msg-sys' }, m.text);
+  const mine = m.role === 'user';
+  return h('div', { class: `msg ${m.role}` },
+    h('div', { class: 'msg-av' }, mine ? initial('you') : icon(m.role === 'error' ? 'alert' : 'chat', 'sm')),
+    h('div', { class: 'msg-body' },
+      mine ? h('div', { class: 'msg-text' }, m.text) : md(m.text),
+      h('div', { class: 'msg-meta' }, time(m.ts), m.cost_usd ? ` · ${money(m.cost_usd)}` : '',
+        m.run_id && !mine ? h('a', { href: '#runs', onclick: e => { e.preventDefault(); S.selRun = m.run_id; go('runs'); } }, ' · log') : null)));
+}
+function renderChatThread(scroll) {
+  const th = $('#chat-thread'); if (!th) return;
+  const busy = S.chatId && S.chatBusy[S.chatId];
+  if (!S.chatId || (!S.chatMsgs.length && !busy)) {
+    const ready = S.assistant?.available !== false;
+    put(th, h('div', { class: 'chat-empty' },
+      h('span', { class: 'logo', style: 'width:44px;height:44px;border-radius:12px' }, icon('chat')),
+      h('h2', {}, 'Maestro Assistant'),
+      h('p', {}, 'Ask about progress, plan work into tickets, create and wire repositories and GitHub boards, unblock stuck tickets or tune the agents. It confirms before anything outward-facing.'),
+      ready ? null : h('div', { class: 'note' }, icon('alert', 'sm'), `The assistant agent “${S.assistant?.agent || 'maestro'}” was not found — create it in Agents, cells, skills or pick another one in Settings → Execution.`),
+      h('div', { class: 'chips' }, CHAT_SUGGESTIONS.map(([l, t]) => h('button', { type: 'button', class: 'chip', onclick: () => {
+        if (t.endsWith(': ')) { const b = $('#chat-text'); b.value = t; b.focus(); b.setSelectionRange(t.length, t.length); } else sendChat(t);
+      } }, l)))));
+    return;
+  }
+  put(th, h('div', { class: 'chat-inner' }, S.chatMsgs.map(chatMessage), busy ? liveBox() : null));
+  if (scroll) th.scrollTop = th.scrollHeight;
+}
+function renderChatList() {
+  const el = $('#chat-list'); if (!el) return;
+  put(el,
+    btn('plus', 'New chat', { class: 'btn sm primary', style: 'width:100%;margin-bottom:10px', onclick: newChat }),
+    (S.chats || []).length ? (S.chats || []).map(c => h('div', { class: 'chat-item' + (c.id === S.chatId ? ' on' : ''), onclick: () => openChat(c.id) },
+      h('div', { class: 'ci-t' }, S.chatBusy[c.id] ? h('span', { class: 'spin' }) : null, c.title),
+      h('div', { class: 'ci-m' }, ago(c.updated_at), c.cost_usd ? ` · ${money(c.cost_usd)}` : '')))
+      : h('div', { class: 'muted small', style: 'padding:8px' }, S.chats === null ? 'Loading…' : 'No conversations yet'));
+}
+function renderChatHead() {
+  const el = $('#chat-head'); if (!el) return;
+  const c = (S.chats || []).find(x => x.id === S.chatId);
+  put(el, h('div', { class: 'ch-t' }, h('b', {}, c ? c.title : 'Assistant'), h('small', {}, `agent ${S.assistant?.agent || 'maestro'}${c?.cost_usd ? ' · ' + money(c.cost_usd) : ''}`)),
+    c ? h('div', { class: 'row-btns', style: 'margin:0' },
+      btn('edit', '', { class: 'icon-btn sm', title: 'Rename', onclick: async () => { const n = await promptDialog({ title: 'Rename conversation', label: 'Title', value: c.title, ok: 'Rename' }); if (n) act(async () => { await api(`/api/chats/${c.id}`, { method: 'PUT', body: { title: n } }); await loadChats(); }); } }),
+      btn('reset', '', { class: 'icon-btn sm', title: 'Start a fresh context (the assistant forgets this conversation)', onclick: async () => {
+        if (await confirmDialog('The assistant will not remember the messages above (they stay visible). Useful when the conversation got long or confused.', { title: 'Fresh context?', ok: 'Reset context' })) act(async () => { await api(`/api/chats/${c.id}/reset`, { method: 'POST' }); await openChat(c.id); }, 'Context reset');
+      } }),
+      btn('trash', '', { class: 'icon-btn sm', title: 'Delete conversation', onclick: async () => {
+        if (await confirmDialog(`Delete “${c.title}”?`, { title: 'Delete conversation?', ok: 'Delete', danger: true })) act(async () => { await api(`/api/chats/${c.id}`, { method: 'DELETE' }); S.chatId = null; S.chatMsgs = []; await loadChats(); refreshChat(); });
+      } })) : null);
+}
+function renderChatInput() {
+  const el = $('#chat-form'); if (!el) return;
+  const busy = S.chatId && S.chatBusy[S.chatId];
+  const sendBtn = $('#chat-send');
+  if (sendBtn) put(sendBtn, busy ? [icon('stop', 'sm'), lbl('Stop')] : [icon('send', 'sm'), lbl('Send')]);
+  if (sendBtn) sendBtn.className = busy ? 'btn danger' : 'btn primary';
+}
+function refreshChat(scroll) { renderChatList(); renderChatHead(); renderChatThread(scroll); renderChatInput(); }
+function viewAssistant() {
+  if (S.chats === null) {
+    loadChats().then(() => {
+      let last = null; try { last = +localStorage.getItem('maestro-chat'); } catch (e) { /* storage unavailable */ }
+      const pick = (S.chats || []).find(c => c.id === last) || (S.chats || [])[0];
+      if (pick && !S.chatId) openChat(pick.id); else refreshChat(true);
+    });
+  }
+  const ta = h('textarea', { id: 'chat-text', rows: 1, placeholder: 'Message the assistant…  (Enter to send, Shift+Enter for a new line)', autofocus: true,
+    oninput: e => { S.chatDraft = e.target.value; e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 220) + 'px'; },
+    onkeydown: e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!(S.chatId && S.chatBusy[S.chatId])) sendChat(); } } }, S.chatDraft || '');
+  const view = h('div', { class: 'chat' },
+    h('aside', { class: 'chat-list', id: 'chat-list' }),
+    h('section', { class: 'chat-main' },
+      h('div', { class: 'chat-head', id: 'chat-head' }),
+      h('div', { class: 'chat-thread', id: 'chat-thread' }),
+      h('form', { class: 'chat-form', id: 'chat-form', onsubmit: e => { e.preventDefault(); if (S.chatId && S.chatBusy[S.chatId]) act(() => api(`/api/chats/${S.chatId}/cancel`, { method: 'POST' })); else sendChat(); } },
+        ta, h('button', { class: 'btn primary', id: 'chat-send', type: 'submit' }, icon('send', 'sm'), lbl('Send')))));
+  setTimeout(() => { refreshChat(true); $('#chat-text')?.focus(); }, 0);
+  return view;
 }
 
 // ───────── SETTINGS
@@ -880,19 +1160,37 @@ function viewSettings() {
   const cur = activeProject();
   const tabs = {
     project: () => [
-      cur ? section(cur.name, `${cur.project_owner} · project #${cur.project_number}. These settings only apply to this project.`,
+      cur ? section(cur.name, `${projectSubtitle(cur)}. These settings only apply to this project.`,
         testRow(
           btn('edit', 'Rename', { class: 'btn sm', onclick: async () => { const n = await promptDialog({ title: 'Rename project', label: 'Name', value: cur.name, ok: 'Rename' }); if (n) act(async () => { await api('/api/projects/rename', { method: 'POST', body: { key: cur.key, name: n } }); await load(); }); } }),
           test('/api/settings/test-github', 'Test connection'),
-          btn('plus', 'Add another project', { class: 'btn sm', onclick: openProjectPicker })), out) : section('No project yet', 'Pick one of your GitHub projects to get started.',
-        btn('github', 'Choose a GitHub project…', { class: 'btn primary', onclick: openProjectPicker })),
-      section('Board', 'Which project and which columns Maestro watches.',
-        h('div', { class: 'grid3' },
-          inp('project_owner', 'Project owner', 'User or organization'),
-          inp('project_number', 'Project number', 'github.com/users/<owner>/projects/<number>', 'number'),
-          inp('status_field', 'Status field', 'Single-select field used as kanban columns')),
+          btn('plus', 'Add another project', { class: 'btn sm', onclick: () => openProjectPicker() })), out) : section('No project yet', 'Add your repositories (or a GitHub Project board) to get started — or ask the Assistant to create them.',
+        testRow(btn('repo', 'Add repositories…', { class: 'btn primary', onclick: () => openProjectPicker('repo') }), btn('board', 'Use a GitHub board…', { class: 'btn', onclick: () => openProjectPicker('project') }), btn('chat', 'Ask the Assistant', { class: 'btn', onclick: () => go('assistant') }))),
+      section('Source', 'Where tickets come from and how their progress is shown on GitHub.',
+        h('div', { class: 'seg', style: 'margin-bottom:14px' },
+          h('button', { type: 'button', class: s.source !== 'project' ? 'on' : '', onclick: () => { s.source = 'repo'; render(); } }, icon('repo', 'sm'), 'Repositories (labels)'),
+          h('button', { type: 'button', class: s.source === 'project' ? 'on' : '', onclick: () => { s.source = 'project'; render(); } }, icon('board', 'sm'), 'GitHub Project board')),
+        s.source !== 'project' ? [
+          h('label', { class: 'f' }, h('span', {}, 'Repositories'),
+            h('textarea', { rows: 3, oninput: e => s.repos = e.target.value, placeholder: 'owner/game\nowner/engine' }, s.repos || ''),
+            h('small', {}, 'One owner/name per line, the primary first. Maestro creates its labels on them when you save.')),
+          h('div', { class: 'grid2' },
+            inp('trigger_label', 'Trigger label', 'An open issue with this label is picked up'),
+            h('div', { class: 'f' }, h('span', {}, 'Status labels'), h('div', { class: 'small muted', style: 'padding-top:6px' }, [s.col_in_progress, s.col_review, s.col_done, s.col_blocked].filter(Boolean).map(c => h('span', { class: 'pill mono', style: 'margin:0 4px 4px 0' }, 'maestro:' + c.toLowerCase().trim().split(/\s+/).join('-')))))),
+          h('details', { class: 'pp-manual', open: s.project_number > 0 }, h('summary', {}, 'Mirror to a GitHub Project board (optional)'),
+            h('p', { class: 'small muted' }, 'Issues are added to the board and its Status column follows the labels. Needs the token scope project.'),
+            h('div', { class: 'grid3' },
+              inp('project_owner', 'Board owner', 'User or organization (empty = no mirror)'),
+              inp('project_number', 'Board number', 'github.com/users/<owner>/projects/<number>', 'number'),
+              inp('status_field', 'Status field', 'Single-select field'))),
+        ] : [
+          h('div', { class: 'grid3' },
+            inp('project_owner', 'Project owner', 'User or organization'),
+            inp('project_number', 'Project number', 'github.com/users/<owner>/projects/<number>', 'number'),
+            inp('status_field', 'Status field', 'Single-select field used as kanban columns')),
+        ],
         h('div', { class: 'grid2' },
-          inp('col_trigger', 'Trigger column', 'Cards moved here get picked up'),
+          inp('col_trigger', 'Trigger column', s.source !== 'project' ? 'Name shown for queued tickets (board mirror column)' : 'Cards moved here get picked up'),
           inp('col_in_progress', 'In progress', ''), inp('col_review', 'In review', ''), inp('col_done', 'Done', ''))),
       section('Repository', 'Where agents work for this project.',
         inp('base_branch', 'Base branch', 'Empty = repository default branch'),
@@ -920,7 +1218,7 @@ function viewSettings() {
       testRow(test('/api/settings/test-github', 'Test GitHub')), out,
       h('div', { class: 'grid2' },
         sel('github_auth', 'Authentication', [['token', 'Personal access token'], ['gh_cli', 'Use `gh auth token` (GitHub CLI login)']]),
-        inp('github_token', 'Token', 'Classic PAT with scopes repo + project. Prefer MAESTRO_GITHUB_TOKEN in .env', 'password'),
+        inp('github_token', 'Token', 'Classic PAT with scope repo (+ project for boards, + admin:org to create org repositories). Prefer MAESTRO_GITHUB_TOKEN in .env', 'password'),
         inp('poll_seconds', 'Sync interval (seconds)', '', 'number')))],
     execution: () => [
       section('Concurrency & limits', 'How many agents run at once and when to give up.',
@@ -931,7 +1229,8 @@ function viewSettings() {
       section('Routing & review', 'How tickets flow once they are picked up.',
         h('div', { class: 'grid2' },
           sel('orchestrator_agent', 'Orchestrator agent', S.agents.map(a => [a.name, a.name])),
-          sel('reviewer_agent', 'Reviewer agent', S.agents.map(a => [a.name, a.name]))),
+          sel('reviewer_agent', 'Reviewer agent', S.agents.map(a => [a.name, a.name])),
+          sel('assistant_agent', 'Assistant agent', S.agents.map(a => [a.name, a.name]), 'The agent you chat with in the Assistant view')),
         chk('review_enabled', 'Reviewer agent checks every PR (and sends feedback back to the worker)'),
         chk('auto_merge', 'Auto-merge (squash) approved PRs'),
         chk('always_triage', 'Always ask the orchestrator (ignore label routing)'))],
@@ -942,7 +1241,7 @@ function viewSettings() {
         section('MCP (ticket tools)', 'Worker agents get list_tickets, get_ticket, list_agents, create_ticket, comment_ticket and close_ticket automatically.',
           h('p', { class: 'small muted', style: 'margin:0 0 14px' }, 'Opt out per agent with ', h('code', {}, 'maestro_tools: false'), '.'),
           chk('mcp_auto_queue', 'Tickets created by agents are queued right away (otherwise they land in the backlog for you to start)'),
-          h('p', { class: 'small', style: 'margin:6px 0 8px;color:var(--tx-2)' }, 'Use the same tools from your own Claude Code:'),
+          h('p', { class: 'small', style: 'margin:6px 0 8px;color:var(--tx-2)' }, 'Use the same tools from your own Claude Code (add ', h('code', {}, '?scope=assistant'), ' to the URL for the Assistant\'s admin tools: projects, repositories, boards, engine):'),
           h('div', { class: 'code-block', style: 'margin-bottom:14px' },
             h('pre', { class: 'body-md mono small', style: 'max-height:none;padding-right:80px' }, cmd),
             cmd ? btn('copy', 'Copy', { class: 'btn xs', onclick: async () => { try { await navigator.clipboard.writeText(cmd); toast('Copied to clipboard', 'ok'); } catch (e) { toast('Copy failed — select the text manually', 'warn'); } } }) : null)),

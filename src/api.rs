@@ -3,7 +3,7 @@
 use crate::agents::{parse_agent, parse_cell, render_agent, render_cell};
 use crate::app::AppRef;
 use crate::model::*;
-use crate::{claude, engine};
+use crate::{chat, claude, engine, projects};
 use axum::extract::{Path, State as AxState};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -69,6 +69,11 @@ pub fn router(app: AppRef) -> Router {
         .route("/api/skills/{name}", put(put_skill).delete(del_skill))
         .route("/api/plan", post(plan))
         .route("/api/plan/apply", post(plan_apply))
+        .route("/api/chats", get(chats).post(chat_create))
+        .route("/api/chats/{id}", get(chat_get).delete(chat_delete).put(chat_rename))
+        .route("/api/chats/{id}/messages", post(chat_send))
+        .route("/api/chats/{id}/cancel", post(chat_cancel))
+        .route("/api/chats/{id}/reset", post(chat_reset))
         .with_state(app)
 }
 
@@ -95,6 +100,8 @@ async fn state(AxState(app): AxState<AppRef>) -> R {
         "project": project,
         "projects": app.db.projects(title.as_deref()),
         "active_project": s.project_key(),
+        "source": {"mode": if s.repo_mode() { "repo" } else { "project" }, "repos": s.repo_list(), "trigger_label": s.trigger_label, "mirror": s.repo_mode() && s.has_project()},
+        "assistant": {"agent": s.assistant_agent, "available": app.lib.agent(&s.assistant_agent).is_some(), "busy": chat::busy_map(&app)},
         "stats": app.db.stats(),
         "statemachine": sm_json(),
         "runs": app.db.runs(None, 60),
@@ -171,18 +178,7 @@ async fn put_settings(AxState(app): AxState<AppRef>, Json(mut new): Json<Setting
     keep(&mut new.github_token, &old.github_token);
     keep(&mut new.claude_oauth_token, &old.claude_oauth_token);
     keep(&mut new.anthropic_api_key, &old.anthropic_api_key);
-    let new = new.with_defaults();
-    let project_changed = new.project_owner != old.project_owner || new.project_number != old.project_number || new.status_field != old.status_field;
-    app.db.save_settings(&new)?;
-    if project_changed {
-        // editing the active project's owner/number re-points it; keep its tickets and name
-        let (ok, nk) = (old.project_key(), new.project_key());
-        if !ok.is_empty() && !nk.is_empty() && ok != nk {
-            app.db.rekey_project(&ok, &nk);
-        }
-        *app.project.lock() = None;
-    }
-    app.wake.notify_one();
+    let new = projects::save_settings(&app, &old, new)?;
     Ok(Json(json!(new.redacted())))
 }
 
@@ -190,8 +186,11 @@ async fn test_github(AxState(app): AxState<AppRef>) -> R {
     let gh = app.github().await?;
     let login = gh.viewer().await?;
     let s = app.db.settings();
-    let mut out = json!({"login": login});
-    if !s.project_owner.is_empty() && s.project_number > 0 {
+    let mut out = json!({"login": login, "source": if s.repo_mode() { "repo" } else { "project" }});
+    if s.repo_mode() {
+        out["repos"] = json!(projects::check_repos(&gh, &s.repo_list()).await);
+    }
+    if s.has_project() {
         let p = app.project_info(&gh, true).await?;
         let cols: Vec<&String> = p.options.iter().map(|(_, n)| n).collect();
         let missing: Vec<&str> = [&s.col_trigger, &s.col_in_progress, &s.col_review, &s.col_done]
@@ -199,7 +198,7 @@ async fn test_github(AxState(app): AxState<AppRef>) -> R {
             .filter(|c| !c.is_empty() && p.option_id(c).is_none())
             .map(|c| c.as_str())
             .collect();
-        out["project"] = json!({"title": p.title, "url": p.url, "columns": cols, "missing_columns": missing});
+        out[if s.repo_mode() { "mirror_project" } else { "project" }] = json!({"title": p.title, "url": p.url, "columns": cols, "missing_columns": missing});
     }
     Ok(Json(out))
 }
@@ -307,79 +306,33 @@ async fn projects(AxState(app): AxState<AppRef>) -> R {
     Ok(Json(json!({"projects": app.db.projects(title.as_deref()), "active": app.db.settings().project_key()})))
 }
 
-/// Make `key` the active project. Only one project runs at a time: the engine is paused
-/// and the switch is refused while agents are working.
-async fn activate(app: &AppRef, mut list: Vec<ProjectProfile>, key: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(app.busy.lock().is_empty(), "Agents are still running — pause the engine and wait for them to finish before switching project");
-    let target = list.iter().find(|p| p.key == key).cloned().ok_or_else(|| anyhow::anyhow!("unknown project"))?;
-    let mut s = app.db.settings();
-    s.apply_profile(&target);
-    s.engine_enabled = false;
-    let s = s.with_defaults();
-    // persist the (refreshed) outgoing profile + the target
-    if let Some(p) = list.iter_mut().find(|p| p.key == key) {
-        *p = s.to_profile(&target.name);
-    }
-    app.db.save_projects(&list);
-    app.db.save_settings(&s)?;
-    *app.project.lock() = None;
-    *app.last_sync.lock() = None;
-    app.wake.notify_one();
-    let app2 = app.clone();
-    tokio::spawn(async move {
-        if let Err(e) = engine::sync_once(&app2).await {
-            *app2.last_sync.lock() = Some((crate::db::now(), Some(e.to_string())));
-            app2.notice("warn", format!("sync: {e}"));
-        }
-    });
-    Ok(())
-}
-
 async fn project_switch(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
-    let key = b["key"].as_str().unwrap_or("").to_string();
-    let title = app.project.lock().as_ref().map(|p| p.title.clone());
-    let list = app.db.projects(title.as_deref());
-    activate(&app, list, &key).await?;
+    projects::switch(&app, b["key"].as_str().unwrap_or("")).await?;
     Ok(Json(json!({"ok": true})))
 }
 
+/// `{kind: "repo", repos: [...], name?}` or `{owner, number, title?}` (a GitHub Project board).
 async fn project_add(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
-    let owner = b["owner"].as_str().unwrap_or("").trim().to_string();
-    let number = b["number"].as_i64().unwrap_or(0);
-    let key = project_key(&owner, number);
-    if !(!key.is_empty()) { return Err(anyhow::anyhow!("owner and project number are required").into()); }
-    let title = app.project.lock().as_ref().map(|p| p.title.clone());
-    let mut list = app.db.projects(title.as_deref());
-    if !list.iter().any(|p| p.key == key) {
-        let mut s = Settings::default().with_defaults();
-        s.project_owner = owner.clone();
-        s.project_number = number;
-        // validate against GitHub (also resolves the real title and checks the Status field)
-        let gh = app.github().await?;
-        let info = gh.project(&owner, number, &s.status_field).await?;
-        let name = b["title"].as_str().filter(|t| !t.is_empty()).unwrap_or(&info.title).to_string();
-        list.push(s.to_profile(&name));
-    }
-    activate(&app, list, &key).await?;
+    let key = if b["kind"].as_str() == Some("repo") || b.get("repos").is_some() {
+        let repos: Vec<String> = match &b["repos"] {
+            Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+            Value::String(s) => parse_repos(s),
+            _ => vec![],
+        };
+        projects::add_repo_project(&app, &repos, b["name"].as_str(), None).await?
+    } else {
+        projects::add_board_project(&app, b["owner"].as_str().unwrap_or(""), b["number"].as_i64().unwrap_or(0), b["title"].as_str()).await?
+    };
     Ok(Json(json!({"ok": true, "key": key})))
 }
 
 async fn project_remove(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
-    let key = b["key"].as_str().unwrap_or("");
-    if !(key != app.db.settings().project_key()) { return Err(anyhow::anyhow!("Switch to another project before removing this one").into()); }
-    app.db.delete_project(key);
+    projects::remove(&app, b["key"].as_str().unwrap_or(""))?;
     Ok(Json(json!({"ok": true})))
 }
 
 async fn project_rename(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
-    let key = b["key"].as_str().unwrap_or("");
-    let name = b["name"].as_str().unwrap_or("").trim();
-    if !(!name.is_empty()) { return Err(anyhow::anyhow!("name is empty").into()); }
-    let mut list = app.db.projects(None);
-    if let Some(p) = list.iter_mut().find(|p| p.key == key) {
-        p.name = name.into();
-    }
-    app.db.save_projects(&list);
+    projects::rename(&app, b["key"].as_str().unwrap_or(""), b["name"].as_str().unwrap_or(""))?;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -391,4 +344,53 @@ async fn gh_projects(AxState(app): AxState<AppRef>) -> R {
 async fn gh_repos(AxState(app): AxState<AppRef>) -> R {
     let gh = app.github().await?;
     Ok(Json(json!(gh.list_repos().await?)))
+}
+
+// ───────────────────────────── assistant chats
+
+async fn chats(AxState(app): AxState<AppRef>) -> R {
+    Ok(Json(json!({"chats": app.db.chats(), "busy": chat::busy_map(&app)})))
+}
+
+async fn chat_create(AxState(app): AxState<AppRef>, body: Option<Json<Value>>) -> R {
+    let title = body.as_ref().and_then(|b| b["title"].as_str()).filter(|t| !t.trim().is_empty()).unwrap_or(chat::NEW_TITLE).to_string();
+    let c = app.db.create_chat(&title)?;
+    app.emit(Event::Chats);
+    Ok(Json(json!(c)))
+}
+
+async fn chat_get(AxState(app): AxState<AppRef>, Path(id): Path<i64>) -> R {
+    let c = app.db.chat(id).ok_or_else(|| anyhow::anyhow!("chat not found"))?;
+    let run = app.chat_runs.lock().get(&id).copied();
+    Ok(Json(json!({"chat": c, "messages": app.db.chat_messages(id), "run_id": run})))
+}
+
+async fn chat_delete(AxState(app): AxState<AppRef>, Path(id): Path<i64>) -> R {
+    chat::cancel(&app, id);
+    app.db.delete_chat(id);
+    app.emit(Event::Chats);
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn chat_rename(AxState(app): AxState<AppRef>, Path(id): Path<i64>, Json(b): Json<Value>) -> R {
+    let t = b["title"].as_str().unwrap_or("").trim();
+    if t.is_empty() { return Err(anyhow::anyhow!("title is empty").into()); }
+    app.db.update_chat(id, Some(t), None, 0.0);
+    app.emit(Event::Chats);
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn chat_send(AxState(app): AxState<AppRef>, Path(id): Path<i64>, Json(b): Json<Value>) -> R {
+    let (msg, run) = chat::send(&app, id, b["text"].as_str().unwrap_or("")).await?;
+    Ok(Json(json!({"message": msg, "run_id": run})))
+}
+
+async fn chat_cancel(AxState(app): AxState<AppRef>, Path(id): Path<i64>) -> R {
+    Ok(Json(json!({"ok": chat::cancel(&app, id)})))
+}
+
+async fn chat_reset(AxState(app): AxState<AppRef>, Path(id): Path<i64>) -> R {
+    app.db.reset_chat_session(id);
+    app.db.add_chat_message(id, "system", "New conversation context: the assistant does not remember the messages above.", None, 0.0)?;
+    Ok(Json(json!({"ok": true})))
 }
