@@ -141,11 +141,63 @@ impl Db {
         conn.execute_batch(SCHEMA)?;
         // migrations (ignore "duplicate column" on already-migrated DBs)
         let _ = conn.execute("ALTER TABLE tickets ADD COLUMN helpers TEXT NOT NULL DEFAULT '[]'", []);
+        let _ = conn.execute("ALTER TABLE tickets ADD COLUMN project TEXT NOT NULL DEFAULT ''", []);
         // Crash recovery: anything left "running" is retried.
         conn.execute("UPDATE runs SET status='interrupted', finished_at=?1 WHERE status='running'", [now()])?;
         conn.execute("UPDATE tickets SET state='ready' WHERE state='running'", [])?;
         conn.execute("UPDATE tickets SET state='awaiting_merge' WHERE state='reviewing'", [])?;
-        Ok(Db { conn: Mutex::new(conn) })
+        let db = Db { conn: Mutex::new(conn) };
+        // tickets created before multi-project support belong to the active project
+        let key = db.settings().project_key();
+        if !key.is_empty() {
+            let _ = db.conn.lock().execute("UPDATE tickets SET project=?1 WHERE project=''", [key]);
+        }
+        Ok(db)
+    }
+
+    // ---------- projects (profiles)
+    fn stored_projects(&self) -> Vec<ProjectProfile> {
+        self.meta("projects").and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+    }
+
+    /// Saved projects, with the active one refreshed from the current settings.
+    /// `title` names the active project when it has no name yet.
+    pub fn projects(&self, title: Option<&str>) -> Vec<ProjectProfile> {
+        let mut list = self.stored_projects();
+        let s = self.settings();
+        let key = s.project_key();
+        if !key.is_empty() {
+            let name = list.iter().find(|p| p.key == key).map(|p| p.name.clone()).filter(|n| !n.is_empty())
+                .or_else(|| title.map(String::from))
+                .unwrap_or_else(|| format!("{} #{}", s.project_owner, s.project_number));
+            let prof = s.to_profile(&name);
+            match list.iter_mut().find(|p| p.key == key) {
+                Some(p) => *p = prof,
+                None => list.push(prof),
+            }
+        }
+        list
+    }
+
+    pub fn save_projects(&self, list: &[ProjectProfile]) {
+        if let Ok(j) = serde_json::to_string(list) {
+            self.set_meta("projects", &j);
+        }
+    }
+
+    /// A project was edited to point somewhere else: keep its tickets.
+    pub fn rekey_project(&self, old: &str, new: &str) {
+        let mut list = self.stored_projects();
+        list.retain(|p| p.key != old);
+        self.save_projects(&list);
+        let _ = self.conn.lock().execute("UPDATE tickets SET project=?2 WHERE project=?1", params![old, new]);
+    }
+
+    pub fn delete_project(&self, key: &str) {
+        let mut list = self.stored_projects();
+        list.retain(|p| p.key != key);
+        self.save_projects(&list);
+        let _ = self.conn.lock().execute("DELETE FROM tickets WHERE project=?1", [key]);
     }
 
     // ---------- settings
@@ -218,10 +270,12 @@ impl Db {
         }
     }
 
+    /// Tickets of the active project.
     pub fn tickets(&self) -> Vec<Ticket> {
+        let key = self.settings().project_key();
         let c = self.conn.lock();
-        let mut st = c.prepare(&format!("SELECT {TICKET_COLS} FROM tickets ORDER BY id")).unwrap();
-        let mut v: Vec<Ticket> = st.query_map([], row_ticket).unwrap().filter_map(|x| x.ok()).collect();
+        let mut st = c.prepare(&format!("SELECT {TICKET_COLS} FROM tickets WHERE project=?1 ORDER BY id")).unwrap();
+        let mut v: Vec<Ticket> = st.query_map([&key], row_ticket).unwrap().filter_map(|x| x.ok()).collect();
         drop(st);
         for t in v.iter_mut() {
             Self::attach_deps(&c, t);
@@ -241,11 +295,12 @@ impl Db {
     }
 
     pub fn ticket_by_number(&self, repo: &str, number: i64) -> Option<Ticket> {
+        let key = self.settings().project_key();
         let id: i64 = {
             let c = self.conn.lock();
             c.query_row(
-                "SELECT id FROM tickets WHERE lower(repo)=lower(?1) AND number=?2",
-                params![repo, number],
+                "SELECT id FROM tickets WHERE lower(repo)=lower(?1) AND number=?2 AND project=?3",
+                params![repo, number, key],
                 |r| r.get(0),
             )
             .optional()
@@ -257,6 +312,7 @@ impl Db {
 
     /// Upsert from GitHub. Returns (ticket, is_new).
     pub fn upsert_synced(&self, it: &SyncedItem) -> Result<(Ticket, bool)> {
+        let project = self.settings().project_key();
         let id: Option<i64> = {
             let c = self.conn.lock();
             let existing: Option<i64> = c
@@ -266,15 +322,15 @@ impl Db {
             match existing {
                 Some(id) => {
                     c.execute(
-                        "UPDATE tickets SET issue_node_id=?2,repo=?3,number=?4,title=?5,body=?6,url=?7,labels=?8,gh_status=?9,gh_state=?10 WHERE id=?1",
-                        params![id, it.issue_node_id, it.repo, it.number, it.title, it.body, it.url, labels, it.gh_status, it.gh_state],
+                        "UPDATE tickets SET issue_node_id=?2,repo=?3,number=?4,title=?5,body=?6,url=?7,labels=?8,gh_status=?9,gh_state=?10,project=?11 WHERE id=?1",
+                        params![id, it.issue_node_id, it.repo, it.number, it.title, it.body, it.url, labels, it.gh_status, it.gh_state, project],
                     )?;
                     Some(id)
                 }
                 None => {
                     c.execute(
-                        "INSERT INTO tickets(item_id,issue_node_id,repo,number,title,body,url,labels,gh_status,gh_state,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                        params![it.item_id, it.issue_node_id, it.repo, it.number, it.title, it.body, it.url, labels, it.gh_status, it.gh_state, now()],
+                        "INSERT INTO tickets(item_id,issue_node_id,repo,number,title,body,url,labels,gh_status,gh_state,updated_at,project) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                        params![it.item_id, it.issue_node_id, it.repo, it.number, it.title, it.body, it.url, labels, it.gh_status, it.gh_state, now(), project],
                     )?;
                     None
                 }
@@ -290,10 +346,11 @@ impl Db {
     }
 
     pub fn remove_missing(&self, keep_item_ids: &[String]) -> Vec<i64> {
+        let key = self.settings().project_key();
         let all: Vec<(i64, String)> = {
             let c = self.conn.lock();
-            let mut st = c.prepare("SELECT id,item_id FROM tickets").unwrap();
-            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(|x| x.ok()).collect()
+            let mut st = c.prepare("SELECT id,item_id FROM tickets WHERE project=?1").unwrap();
+            st.query_map([&key], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(|x| x.ok()).collect()
         };
         let mut removed = vec![];
         for (id, item) in all {

@@ -285,6 +285,69 @@ impl Settings {
     }
 }
 
+/// Per-project configuration. The active project's values live in `Settings`;
+/// switching swaps these fields in and out.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProjectProfile {
+    pub key: String,
+    pub name: String,
+    pub project_owner: String,
+    pub project_number: i64,
+    pub status_field: String,
+    pub col_trigger: String,
+    pub col_in_progress: String,
+    pub col_review: String,
+    pub col_done: String,
+    pub col_blocked: String,
+    pub base_branch: String,
+    pub repo_paths: String,
+}
+
+pub fn project_key(owner: &str, number: i64) -> String {
+    if owner.trim().is_empty() || number <= 0 {
+        String::new()
+    } else {
+        format!("{}/{}", owner.trim().to_lowercase(), number)
+    }
+}
+
+impl Settings {
+    pub fn project_key(&self) -> String {
+        project_key(&self.project_owner, self.project_number)
+    }
+
+    pub fn to_profile(&self, name: &str) -> ProjectProfile {
+        ProjectProfile {
+            key: self.project_key(),
+            name: name.into(),
+            project_owner: self.project_owner.clone(),
+            project_number: self.project_number,
+            status_field: self.status_field.clone(),
+            col_trigger: self.col_trigger.clone(),
+            col_in_progress: self.col_in_progress.clone(),
+            col_review: self.col_review.clone(),
+            col_done: self.col_done.clone(),
+            col_blocked: self.col_blocked.clone(),
+            base_branch: self.base_branch.clone(),
+            repo_paths: self.repo_paths.clone(),
+        }
+    }
+
+    pub fn apply_profile(&mut self, p: &ProjectProfile) {
+        self.project_owner = p.project_owner.clone();
+        self.project_number = p.project_number;
+        self.status_field = p.status_field.clone();
+        self.col_trigger = p.col_trigger.clone();
+        self.col_in_progress = p.col_in_progress.clone();
+        self.col_review = p.col_review.clone();
+        self.col_done = p.col_done.clone();
+        self.col_blocked = p.col_blocked.clone();
+        self.base_branch = p.base_branch.clone();
+        self.repo_paths = p.repo_paths.clone();
+    }
+}
+
 /// Events pushed to the UI over SSE.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

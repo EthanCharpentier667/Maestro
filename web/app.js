@@ -65,7 +65,7 @@ function stateBadge(s) { return h('span', { class: 'pill state', style: `backgro
 async function load() {
   const d = await api('/api/state');
   S.tickets = new Map(d.tickets.map(t => [t.id, t]));
-  S.agents = d.agents; S.cells = d.cells || []; S.skills = d.skills; S.settings = d.settings; S.project = d.project; S.stats = d.stats;
+  S.agents = d.agents; S.cells = d.cells || []; S.skills = d.skills; S.settings = d.settings; S.project = d.project; S.projects = d.projects || []; S.activeProject = d.active_project || ''; S.stats = d.stats;
   S.envSecrets = d.env_secrets || []; S.mcp = d.mcp; S.sm = d.statemachine; S.runs = d.runs; S.busy = d.busy; S.lastSync = d.last_sync; S.claudeVersion = d.claude_version;
   renderChrome(); render();
 }
@@ -94,6 +94,7 @@ function scheduleRender() { if (rt) return; rt = setTimeout(() => { rt = null; r
 
 // ───────── chrome
 function renderChrome() {
+  renderProjectSwitcher();
   const ts = [...S.tickets.values()];
   const count = s => ts.filter(t => t.state === s).length;
   $('#proj').innerHTML = S.project ? `${esc(S.project.title)} <small><a href="${esc(S.project.url)}" target="_blank">GitHub ↗</a></small>` : '<span class="muted">No project — open Settings</span>';
@@ -176,7 +177,7 @@ function viewBoard() {
 function onboarding() {
   return h('div', { class: 'card onboard' }, h('h2', {}, '🎼 Welcome to Maestro'),
     h('ol', {},
-      h('li', {}, 'Settings → GitHub: token (scopes ', h('code', {}, 'repo'), ' + ', h('code', {}, 'project'), ') or the ', h('code', {}, 'gh'), ' CLI, then project owner + number.'),
+      h('li', {}, 'Settings → GitHub access: token (scopes ', h('code', {}, 'repo'), ' + ', h('code', {}, 'project'), ') or the ', h('code', {}, 'gh'), ' CLI. Then use the project switcher (top left) to pick a project from your GitHub account.'),
       h('li', {}, 'Settings → Claude Code: “account” uses your local ', h('code', {}, 'claude'), ' login (Pro/Max). Or paste a token from ', h('code', {}, 'claude setup-token'), '.'),
       h('li', {}, 'Tune your team in Agents & skills (orchestrator, engine, gamedev, gamedesign…).'),
       h('li', {}, 'Move a card to the trigger column (“Todo” by default) or use the Planner, then ', h('b', {}, 'Start engine'), '.')),
@@ -243,7 +244,7 @@ async function openTicket(id, refresh = false) {
 }
 
 function newTicket() {
-  const repos = [...new Set([...S.tickets.values()].map(t => t.repo))].sort();
+  const repos = repoChoices();
   const f = { repo: S.planRepo || repos[0] || '', title: '', body: '', agent: '', helpers: [], deps: [], start: false };
   const others = [...S.tickets.values()].filter(t => t.state !== 'done').sort((a, b) => a.number - b.number);
   S.drawerTicket = null;
@@ -405,7 +406,7 @@ function flashTransition(e) {
 
 // ───────── PLANNER
 function viewPlanner() {
-  const repos = [...new Set([...S.tickets.values()].map(t => t.repo))].sort();
+  const repos = repoChoices();
   S.planRepo ||= repos[0] || '';
   const box = h('div', {},
     h('div', { class: 'card' }, h('div', { class: 'h' }, h('h2', {}, '✦ Planner'), h('span', { class: 'muted small' }, 'The orchestrator turns a goal into a dependency graph of GitHub issues.')),
@@ -533,9 +534,99 @@ function agentEditor() {
       ] : [h('h3', {}, 'Skill'), h('p', {}, 'Standard Claude Code SKILL.md: front-matter ', h('code', {}, 'name'), ' + ', h('code', {}, 'description'), ' (tells Claude when to load it), then instructions. Attach it to agents via their ', h('code', {}, 'skills'), ' list.')])));
 }
 
+// repos of the current board first, then the ones GitHub says we can push to (fetched once, best effort)
+function repoChoices() {
+  if (S.repoList === undefined || S.repoList === null) { S.repoList = []; api('/api/github/repos').then(r => { S.repoList = r; }).catch(() => {}); }
+  const own = [...new Set([...S.tickets.values()].map(t => t.repo))].sort();
+  return [...own, ...S.repoList.filter(r => !own.includes(r))];
+}
+
+// ───────── PROJECTS (switcher, like GitHub Desktop)
+const activeProject = () => (S.projects || []).find(p => p.key === S.activeProject);
+
+function renderProjectSwitcher() {
+  const cur = activeProject();
+  const btn = h('button', { class: 'proj-switch', onclick: e => { e.stopPropagation(); toggleProjectMenu(); } },
+    h('span', { class: 'ps-ico' }, '▤'),
+    h('span', { class: 'ps-txt' }, h('small', {}, 'Current project'), h('b', {}, cur ? cur.name : 'No project')),
+    h('span', { class: 'ps-caret' }, '▾'));
+  put($('#proj-switch'), btn);
+}
+
+function closeProjectMenu() { document.querySelector('.proj-menu')?.remove(); }
+function toggleProjectMenu() {
+  if (document.querySelector('.proj-menu')) return closeProjectMenu();
+  const items = (S.projects || []).map(p => h('div', { class: 'pm-item' + (p.key === S.activeProject ? ' on' : ''), onclick: () => { closeProjectMenu(); if (p.key !== S.activeProject) switchProject(p.key); } },
+    h('span', { class: 'pm-check' }, p.key === S.activeProject ? '✓' : ''),
+    h('span', { class: 'pm-name' }, h('b', {}, p.name), h('small', {}, `${p.project_owner} · #${p.project_number}`))));
+  const menu = h('div', { class: 'proj-menu', onclick: e => e.stopPropagation() },
+    items.length ? items : h('div', { class: 'pm-empty' }, 'No project yet'),
+    h('div', { class: 'pm-sep' }),
+    h('div', { class: 'pm-item', onclick: () => { closeProjectMenu(); openProjectPicker(); } }, h('span', { class: 'pm-check' }, '+'), h('span', { class: 'pm-name' }, h('b', {}, 'Add project…'))),
+    h('div', { class: 'pm-item', onclick: () => { closeProjectMenu(); goSettings('project'); } }, h('span', { class: 'pm-check' }, '⚙'), h('span', { class: 'pm-name' }, h('b', {}, 'Project settings'))));
+  $('#proj-switch').append(menu);
+}
+document.addEventListener('click', closeProjectMenu);
+
+function goSettings(tab) {
+  S.view = 'settings'; S.settingsTab = tab || S.settingsTab; S.editing = null;
+  document.querySelectorAll('#nav a').forEach(x => x.classList.toggle('active', x.dataset.view === 'settings'));
+  render();
+}
+
+async function switchProject(key) {
+  const r = await act(() => api('/api/projects/switch', { method: 'POST', body: { key } }));
+  if (!r) return;
+  S.draft = null; S.filter.repo = ''; S.repoList = null;
+  await load();
+  toast(`Switched to ${activeProject()?.name || key} — engine paused`, 'ok');
+}
+
+async function openProjectPicker() {
+  const known = new Set((S.projects || []).map(p => p.key));
+  const st = { list: null, q: '', err: '', owner: '', number: '' };
+  const body = h('div', {});
+  const close = () => ov.remove();
+  const add = async (owner, number, title) => {
+    const r = await act(() => api('/api/projects/add', { method: 'POST', body: { owner, number: +number, title } }));
+    if (!r) return;
+    close(); S.draft = null; S.filter.repo = ''; await load();
+    toast(`Switched to ${activeProject()?.name || owner}`, 'ok');
+  };
+  const draw = () => {
+    const q = st.q.toLowerCase();
+    const list = (st.list || []).filter(p => !q || `${p.owner} ${p.title}`.toLowerCase().includes(q));
+    put(body,
+      h('input', { placeholder: 'Filter your GitHub projects…', value: st.q, autofocus: true, oninput: e => { st.q = e.target.value; draw(); const i = body.querySelector('input'); i.focus(); i.setSelectionRange(99, 99); } }),
+      h('div', { class: 'pp-list' },
+        st.list === null ? h('div', { class: 'muted pp-note' }, st.err ? '' : 'Loading from GitHub…') : null,
+        st.err ? h('div', { class: 'pp-note', style: 'color:var(--err)' }, st.err) : null,
+        list.map(p => h('div', { class: 'pm-item' + (known.has(`${p.owner.toLowerCase()}/${p.number}`) ? ' dim' : ''), onclick: () => add(p.owner, p.number, p.title) },
+          h('span', { class: 'pm-name' }, h('b', {}, p.title), h('small', {}, `${p.owner} · #${p.number}${p.description ? ' — ' + p.description : ''}`)),
+          known.has(`${p.owner.toLowerCase()}/${p.number}`) ? h('span', { class: 'pill' }, 'added') : null)),
+        st.list && !list.length ? h('div', { class: 'muted pp-note' }, 'Nothing matches.') : null),
+      h('details', { class: 'pp-manual' }, h('summary', {}, 'Not listed? Enter it manually'),
+        h('div', { class: 'grid2', style: 'margin-top:10px' },
+          h('label', { class: 'f' }, h('span', {}, 'Owner (user or org)'), h('input', { value: st.owner, oninput: e => st.owner = e.target.value })),
+          h('label', { class: 'f' }, h('span', {}, 'Project number'), h('input', { type: 'number', value: st.number, oninput: e => st.number = e.target.value }))),
+        h('button', { class: 'btn primary', onclick: () => add(st.owner, st.number) }, 'Add project')));
+  };
+  const ov = h('div', { class: 'overlay', onclick: close },
+    h('div', { class: 'modal', onclick: e => e.stopPropagation() },
+      h('div', { class: 'h' }, h('h3', { style: 'margin:0' }, 'Add a GitHub project'), h('button', { class: 'btn ghost sm', onclick: close }, '✕')),
+      h('p', { class: 'small muted', style: 'margin:-6px 0 12px' }, 'Switching pauses the engine. Each project keeps its own board, columns and repo paths.'),
+      body));
+  document.body.append(ov); draw();
+  try { st.list = await api('/api/github/projects'); } catch (e) { st.list = []; st.err = e.message; }
+  draw();
+}
+
 // ───────── SETTINGS
+const SETTINGS_TABS = [['project', 'Project'], ['claude', 'Claude Code'], ['github', 'GitHub access'], ['execution', 'Execution'], ['integrations', 'Git & MCP']];
+
 function viewSettings() {
-  const s = structuredClone(S.settings);
+  S.settingsTab ||= 'project';
+  const s = (S.draft ||= structuredClone(S.settings));
   const inp = (k, label, help, type = 'text', extra = {}) => {
     const env = (S.envSecrets || []).includes(k);
     return h('label', { class: 'f' }, h('span', {}, label),
@@ -545,16 +636,44 @@ function viewSettings() {
   const sel = (k, label, opts, help) => h('label', { class: 'f' }, h('span', {}, label),
     h('select', { onchange: e => { s[k] = e.target.value; } }, opts.map(([v, l]) => h('option', { value: v, selected: s[k] === v }, l))), help ? h('small', {}, help) : null);
   const chk = (k, label) => h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: !!s[k], onchange: e => s[k] = e.target.checked }), label);
-  const save = () => act(async () => { S.settings = await api('/api/settings', { method: 'PUT', body: s }); await load(); }, 'Settings saved');
+  const save = () => act(async () => { S.settings = await api('/api/settings', { method: 'PUT', body: s }); S.draft = null; await load(); }, 'Settings saved');
   const out = h('pre', { class: 'body-md mono small', style: 'display:none' });
   const test = (path, label) => h('button', { class: 'btn', onclick: async ev => {
     ev.target.disabled = true; out.style.display = 'block'; out.textContent = `${label}…`;
     try { await api('/api/settings', { method: 'PUT', body: s }); const r = await api(path, { method: 'POST' }); out.textContent = JSON.stringify(r, null, 2); } catch (e) { out.textContent = '✕ ' + e.message; }
     ev.target.disabled = false;
   } }, label);
-  return h('div', { style: 'max-width:980px' },
-    h('div', { class: 'h' }, h('h2', {}, 'Settings'), h('button', { class: 'btn primary', onclick: save }, 'Save')),
-    h('div', { class: 'card' }, h('div', { class: 'h' }, h('h3', {}, '1 · Claude Code'), test('/api/settings/test-claude', 'Test Claude')),
+  const section = (title, desc, ...kids) => h('div', { class: 'card sec' }, h('h3', {}, title), desc ? h('p', { class: 'small muted' }, desc) : null, ...kids);
+
+  const cur = activeProject();
+  const tabs = {
+    project: () => [
+      cur ? section(cur.name, `${cur.project_owner} · project #${cur.project_number}. These settings only apply to this project.`,
+        h('div', { class: 'row-btns' },
+          h('button', { class: 'btn sm', onclick: () => { const n = prompt('Rename project', cur.name); if (n) act(async () => { await api('/api/projects/rename', { method: 'POST', body: { key: cur.key, name: n } }); await load(); }); } }, 'Rename'),
+          test('/api/settings/test-github', 'Test connection'),
+          h('button', { class: 'btn sm', onclick: openProjectPicker }, '+ Add another project'))) : section('No project yet', 'Pick one of your GitHub projects to get started.',
+        h('button', { class: 'btn primary', onclick: openProjectPicker }, 'Choose a GitHub project…')),
+      section('Board', 'Which project and which columns Maestro watches.',
+        h('div', { class: 'grid2' },
+          inp('project_owner', 'Project owner', 'User or organization'),
+          inp('project_number', 'Project number', 'github.com/users/<owner>/projects/<number>', 'number'),
+          inp('status_field', 'Status field', 'Single-select field used as kanban columns')),
+        h('div', { class: 'grid3' },
+          inp('col_trigger', '▶ Trigger column', 'Cards moved here get picked up'),
+          inp('col_in_progress', 'In progress', ''), inp('col_review', 'In review', ''), inp('col_done', 'Done', ''))),
+      section('Repository', 'Where agents work for this project.',
+        inp('base_branch', 'Base branch', 'Empty = repository default branch'),
+        h('label', { class: 'f' }, h('span', {}, 'Local repository paths (optional)'),
+          h('textarea', { rows: 3, oninput: e => s.repo_paths = e.target.value, placeholder: 'owner/repo=/Users/you/dev/repo' }, s.repo_paths || ''),
+          h('small', {}, 'One per line. Otherwise Maestro clones into its data dir. Each ticket always gets its own git worktree + branch.'))),
+      cur && S.projects.length > 1 ? section('Danger zone', '', h('button', { class: 'btn danger sm', onclick: () => {
+        const other = S.projects.find(p => p.key !== cur.key);
+        if (confirm(`Switch to "${other.name}"?`)) switchProject(other.key);
+      } }, 'Switch to another project to remove one…')) : null,
+    ],
+    claude: () => [section('Claude Code', 'How agents authenticate.',
+      h('div', { class: 'h' }, h('span', {}), test('/api/settings/test-claude', 'Test Claude')),
       h('div', { class: 'grid2' },
         sel('claude_auth', 'Authentication', [['account', 'My Claude account (local `claude` login — Pro/Max)'], ['oauth_token', 'Long-lived token (`claude setup-token`)'], ['api_key', 'Anthropic API key (pay as you go)']],
           'Account mode = whatever `claude` is logged into on this machine (run `claude` once and /login).'),
@@ -563,21 +682,14 @@ function viewSettings() {
         inp('anthropic_api_key', 'API key', 'Prefer MAESTRO_ANTHROPIC_API_KEY in .env', 'password'),
         sel('permission_mode', 'Permission mode for workers', [['acceptEdits', 'acceptEdits — edits auto-approved, tools per agent allow-list'], ['bypassPermissions', 'bypassPermissions — everything allowed (isolated machines only)'], ['default', 'default — only allow-listed tools']]),
         inp('default_model', 'Default model', 'Used when an agent has no model (empty = Claude Code default)'),
-        inp('max_budget_usd', 'Max budget per run (USD, 0 = none)', 'Only meaningful for API-key billing', 'number', { step: '0.5' }))),
-    h('div', { class: 'card', style: 'margin-top:14px' }, h('div', { class: 'h' }, h('h3', {}, '2 · GitHub'), test('/api/settings/test-github', 'Test GitHub')),
+        inp('max_budget_usd', 'Max budget per run (USD, 0 = none)', 'Only meaningful for API-key billing', 'number', { step: '0.5' })))],
+    github: () => [section('GitHub access', 'Shared by all projects.',
+      h('div', { class: 'h' }, h('span', {}), test('/api/settings/test-github', 'Test GitHub')),
       h('div', { class: 'grid2' },
         sel('github_auth', 'Authentication', [['token', 'Personal access token'], ['gh_cli', 'Use `gh auth token` (GitHub CLI login)']]),
         inp('github_token', 'Token', 'Classic PAT with scopes repo + project. Prefer MAESTRO_GITHUB_TOKEN in .env', 'password'),
-        inp('project_owner', 'Project owner (user or org)', 'e.g. Miou-zora'),
-        inp('project_number', 'Project number', 'github.com/users/<owner>/projects/<number>', 'number'),
-        inp('status_field', 'Status field name', 'Single-select field used as kanban columns'),
-        inp('poll_seconds', 'Sync interval (seconds)', '', 'number')),
-      h('div', { class: 'grid3' },
-        inp('col_trigger', '▶ Trigger column', 'Cards moved here get picked up'),
-        inp('col_in_progress', 'In-progress column', ''),
-        inp('col_review', 'Review column', ''),
-        inp('col_done', 'Done column', ''))),
-    h('div', { class: 'card', style: 'margin-top:14px' }, h('h3', { style: 'margin-top:0' }, '3 · Engine'),
+        inp('poll_seconds', 'Sync interval (seconds)', '', 'number')))],
+    execution: () => [section('Execution', 'How tickets flow once they are picked up.',
       h('div', { class: 'grid3' },
         inp('max_parallel', 'Parallel agents', 'Simultaneous Claude processes', 'number'),
         inp('max_attempts', 'Attempts per ticket', 'Before “needs human”', 'number'),
@@ -586,21 +698,20 @@ function viewSettings() {
         sel('reviewer_agent', 'Reviewer agent', S.agents.map(a => [a.name, a.name]))),
       chk('review_enabled', 'Reviewer agent checks every PR (and sends feedback back to the worker)'),
       chk('auto_merge', 'Auto-merge (squash) approved PRs'),
-      chk('always_triage', 'Always ask the orchestrator (ignore label routing)')),
-    h('div', { class: 'card', style: 'margin-top:14px' }, h('h3', { style: 'margin-top:0' }, '4 · Git'),
-      h('div', { class: 'grid2' },
-        inp('base_branch', 'Base branch', 'Empty = repository default branch'),
-        h('div', { class: 'grid2' }, inp('git_author_name', 'Commit author', ''), inp('git_author_email', 'Commit email', ''))),
-      h('label', { class: 'f' }, h('span', {}, 'Local repository paths (optional)'),
-        h('textarea', { rows: 3, oninput: e => s.repo_paths = e.target.value, placeholder: 'owner/repo=/Users/you/dev/repo' }, s.repo_paths || ''),
-        h('small', {}, 'One per line. Otherwise Maestro clones into its data dir. Each ticket always gets its own git worktree + branch.'))),
-    h('div', { class: 'card', style: 'margin-top:14px' }, h('h3', { style: 'margin-top:0' }, '5 · MCP (ticket tools)'),
-      h('p', { class: 'small muted' }, 'Worker agents get these tools automatically: list_tickets, get_ticket, list_agents, create_ticket, comment_ticket, close_ticket. Opt out per agent with ', h('code', {}, 'maestro_tools: false'), '.'),
-      chk('mcp_auto_queue', 'Tickets created by agents are queued right away (otherwise they land in the backlog for you to start)'),
-      h('p', { class: 'small', style: 'margin:10px 0 6px' }, 'Use the same tools from your own Claude Code:'),
-      h('pre', { class: 'body-md mono small', style: 'max-height:none' }, S.mcp ? `claude mcp add --transport http maestro ${S.mcp.url} \\\n  --header "Authorization: Bearer ${S.mcp.token}"` : '')),
-    out,
-    h('div', { style: 'margin:14px 0 30px' }, h('button', { class: 'btn primary', onclick: save }, 'Save settings')));
+      chk('always_triage', 'Always ask the orchestrator (ignore label routing)'))],
+    integrations: () => [
+      section('Git', 'Identity used for agent commits.', h('div', { class: 'grid2' }, inp('git_author_name', 'Commit author', ''), inp('git_author_email', 'Commit email', ''))),
+      section('MCP (ticket tools)', null,
+        h('p', { class: 'small muted' }, 'Worker agents get these tools automatically: list_tickets, get_ticket, list_agents, create_ticket, comment_ticket, close_ticket. Opt out per agent with ', h('code', {}, 'maestro_tools: false'), '.'),
+        chk('mcp_auto_queue', 'Tickets created by agents are queued right away (otherwise they land in the backlog for you to start)'),
+        h('p', { class: 'small', style: 'margin:10px 0 6px' }, 'Use the same tools from your own Claude Code:'),
+        h('pre', { class: 'body-md mono small', style: 'max-height:none' }, S.mcp ? `claude mcp add --transport http maestro ${S.mcp.url} \\\n  --header "Authorization: Bearer ${S.mcp.token}"` : '')),
+    ],
+  };
+  return h('div', { style: 'max-width:900px' },
+    h('div', { class: 'h' }, h('h2', { style: 'margin:0' }, 'Settings'), h('button', { class: 'btn primary', onclick: save }, 'Save')),
+    h('div', { class: 'tabs' }, SETTINGS_TABS.map(([k, l]) => h('a', { class: k === S.settingsTab ? 'on' : '', onclick: () => { S.settingsTab = k; render(); } }, l))),
+    tabs[S.settingsTab](), out);
 }
 
 load().catch(e => toast(e.message, 'error'));

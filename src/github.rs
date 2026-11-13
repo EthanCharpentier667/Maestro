@@ -107,6 +107,34 @@ impl Github {
         Ok(d["viewer"]["login"].as_str().unwrap_or_default().to_string())
     }
 
+    /// Projects V2 the token can see: the viewer's own and those of their organizations.
+    pub async fn list_projects(&self) -> Result<Vec<Value>> {
+        const P: &str = "nodes{number title url closed shortDescription}";
+        let q = format!("query{{ viewer{{ login projectsV2(first:50){{ {P} }} organizations(first:30){{ nodes{{ login projectsV2(first:50){{ {P} }} }} }} }} }}");
+        let d = self.graphql(&q, json!({})).await?;
+        let mut out = vec![];
+        let mut push = |owner: &str, list: &Value| {
+            for p in list["nodes"].as_array().cloned().unwrap_or_default() {
+                if p.is_null() || p["closed"].as_bool().unwrap_or(false) {
+                    continue;
+                }
+                out.push(json!({"owner": owner, "number": p["number"], "title": p["title"], "url": p["url"], "description": p["shortDescription"]}));
+            }
+        };
+        let v = &d["viewer"];
+        push(v["login"].as_str().unwrap_or_default(), &v["projectsV2"]);
+        for o in v["organizations"]["nodes"].as_array().cloned().unwrap_or_default() {
+            push(o["login"].as_str().unwrap_or_default(), &o["projectsV2"]);
+        }
+        Ok(out)
+    }
+
+    /// Repositories the token can push to, most recently pushed first.
+    pub async fn list_repos(&self) -> Result<Vec<String>> {
+        let v = self.rest(reqwest::Method::GET, "/user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator,organization_member", None).await?;
+        Ok(v.as_array().map(|a| a.iter().filter(|r| r["archived"] != true).filter_map(|r| r["full_name"].as_str().map(String::from)).collect()).unwrap_or_default())
+    }
+
     pub async fn project(&self, owner: &str, number: i64, status_field: &str) -> Result<ProjectInfo> {
         const FIELDS: &str = "id title url fields(first:50){nodes{... on ProjectV2SingleSelectField{id name options{id name}}}}";
         let mut proj = Value::Null;

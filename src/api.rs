@@ -52,6 +52,13 @@ pub fn router(app: AppRef) -> Router {
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/settings/test-github", post(test_github))
         .route("/api/settings/test-claude", post(test_claude))
+        .route("/api/projects", get(projects))
+        .route("/api/projects/switch", post(project_switch))
+        .route("/api/projects/add", post(project_add))
+        .route("/api/projects/remove", post(project_remove))
+        .route("/api/projects/rename", post(project_rename))
+        .route("/api/github/projects", get(gh_projects))
+        .route("/api/github/repos", get(gh_repos))
         .route("/api/sync", post(sync))
         .route("/api/engine", post(engine_toggle))
         .route("/api/agents", get(agents))
@@ -76,6 +83,7 @@ async fn state(AxState(app): AxState<AppRef>) -> R {
     let s = app.db.settings();
     let busy: Vec<i64> = app.busy.lock().iter().copied().collect();
     let project = app.project.lock().clone();
+    let title = project.as_ref().map(|p| p.title.clone());
     let last_sync = app.last_sync.lock().clone();
     Ok(Json(json!({
         "tickets": app.db.tickets(),
@@ -85,6 +93,8 @@ async fn state(AxState(app): AxState<AppRef>) -> R {
         "settings": s.redacted(),
         "env_secrets": Settings::env_secrets(),
         "project": project,
+        "projects": app.db.projects(title.as_deref()),
+        "active_project": s.project_key(),
         "stats": app.db.stats(),
         "statemachine": sm_json(),
         "runs": app.db.runs(None, 60),
@@ -165,6 +175,11 @@ async fn put_settings(AxState(app): AxState<AppRef>, Json(mut new): Json<Setting
     let project_changed = new.project_owner != old.project_owner || new.project_number != old.project_number || new.status_field != old.status_field;
     app.db.save_settings(&new)?;
     if project_changed {
+        // editing the active project's owner/number re-points it; keep its tickets and name
+        let (ok, nk) = (old.project_key(), new.project_key());
+        if !ok.is_empty() && !nk.is_empty() && ok != nk {
+            app.db.rekey_project(&ok, &nk);
+        }
         *app.project.lock() = None;
     }
     app.wake.notify_one();
@@ -283,4 +298,97 @@ async fn plan_apply(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
     let created = engine::create_tickets(&app, &gh, &repo, &tickets, None, start).await?;
     app.notice("info", format!("Created {} tickets on GitHub", created.len()));
     Ok(Json(json!({"created": created})))
+}
+
+// ───────────────────────────── projects (switcher)
+
+async fn projects(AxState(app): AxState<AppRef>) -> R {
+    let title = app.project.lock().as_ref().map(|p| p.title.clone());
+    Ok(Json(json!({"projects": app.db.projects(title.as_deref()), "active": app.db.settings().project_key()})))
+}
+
+/// Make `key` the active project. Only one project runs at a time: the engine is paused
+/// and the switch is refused while agents are working.
+async fn activate(app: &AppRef, mut list: Vec<ProjectProfile>, key: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(app.busy.lock().is_empty(), "Agents are still running — pause the engine and wait for them to finish before switching project");
+    let target = list.iter().find(|p| p.key == key).cloned().ok_or_else(|| anyhow::anyhow!("unknown project"))?;
+    let mut s = app.db.settings();
+    s.apply_profile(&target);
+    s.engine_enabled = false;
+    let s = s.with_defaults();
+    // persist the (refreshed) outgoing profile + the target
+    if let Some(p) = list.iter_mut().find(|p| p.key == key) {
+        *p = s.to_profile(&target.name);
+    }
+    app.db.save_projects(&list);
+    app.db.save_settings(&s)?;
+    *app.project.lock() = None;
+    *app.last_sync.lock() = None;
+    app.wake.notify_one();
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = engine::sync_once(&app2).await {
+            *app2.last_sync.lock() = Some((crate::db::now(), Some(e.to_string())));
+            app2.notice("warn", format!("sync: {e}"));
+        }
+    });
+    Ok(())
+}
+
+async fn project_switch(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
+    let key = b["key"].as_str().unwrap_or("").to_string();
+    let title = app.project.lock().as_ref().map(|p| p.title.clone());
+    let list = app.db.projects(title.as_deref());
+    activate(&app, list, &key).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn project_add(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
+    let owner = b["owner"].as_str().unwrap_or("").trim().to_string();
+    let number = b["number"].as_i64().unwrap_or(0);
+    let key = project_key(&owner, number);
+    if !(!key.is_empty()) { return Err(anyhow::anyhow!("owner and project number are required").into()); }
+    let title = app.project.lock().as_ref().map(|p| p.title.clone());
+    let mut list = app.db.projects(title.as_deref());
+    if !list.iter().any(|p| p.key == key) {
+        let mut s = Settings::default().with_defaults();
+        s.project_owner = owner.clone();
+        s.project_number = number;
+        // validate against GitHub (also resolves the real title and checks the Status field)
+        let gh = app.github().await?;
+        let info = gh.project(&owner, number, &s.status_field).await?;
+        let name = b["title"].as_str().filter(|t| !t.is_empty()).unwrap_or(&info.title).to_string();
+        list.push(s.to_profile(&name));
+    }
+    activate(&app, list, &key).await?;
+    Ok(Json(json!({"ok": true, "key": key})))
+}
+
+async fn project_remove(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
+    let key = b["key"].as_str().unwrap_or("");
+    if !(key != app.db.settings().project_key()) { return Err(anyhow::anyhow!("Switch to another project before removing this one").into()); }
+    app.db.delete_project(key);
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn project_rename(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
+    let key = b["key"].as_str().unwrap_or("");
+    let name = b["name"].as_str().unwrap_or("").trim();
+    if !(!name.is_empty()) { return Err(anyhow::anyhow!("name is empty").into()); }
+    let mut list = app.db.projects(None);
+    if let Some(p) = list.iter_mut().find(|p| p.key == key) {
+        p.name = name.into();
+    }
+    app.db.save_projects(&list);
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn gh_projects(AxState(app): AxState<AppRef>) -> R {
+    let gh = app.github().await?;
+    Ok(Json(json!(gh.list_projects().await?)))
+}
+
+async fn gh_repos(AxState(app): AxState<AppRef>) -> R {
+    let gh = app.github().await?;
+    Ok(Json(json!(gh.list_repos().await?)))
 }

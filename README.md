@@ -58,9 +58,14 @@ Everything is configured from the Settings page.
 2. **GitHub**: a classic personal access token with `repo` and `project` scopes, or `gh auth login` and the
    "gh CLI" mode. Set the project owner and number (`github.com/users/<owner>/projects/<number>`), the status
    field name (`Status` by default) and the column names. "Test GitHub" lists the columns it found and any that are missing.
-3. **Engine**: number of parallel agents, attempts per ticket, review rounds, auto-merge, always-triage.
+3. **Execution**: number of parallel agents, attempts per ticket, review rounds, auto-merge, always-triage.
 4. **Git**: base branch, and optional local paths (`owner/repo=/path/to/repo`, one per line). Without a path,
    Maestro clones the repository into its data directory.
+
+**Several projects**: the switcher at the top of the sidebar (like GitHub Desktop) lists your saved projects.
+"Add project…" fetches the GitHub projects your token can see (yours and your organizations'). Each project keeps its
+own board, columns, base branch and repo paths (Settings → Project). Only one project is active at a time: switching
+pauses the engine, and is refused while agents are running.
 
 Then click "Start engine".
 
