@@ -67,10 +67,11 @@ CREATE TABLE IF NOT EXISTS logs (
   ts TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS logs_run ON logs(run_id);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE INDEX IF NOT EXISTS runs_ticket ON runs(ticket_id);
 "#;
 
-const TICKET_COLS: &str = "id,item_id,issue_node_id,repo,number,title,body,url,labels,gh_status,gh_state,state,agent,parent,branch,pr_number,pr_url,attempts,review_rounds,feedback,note,cost_usd,updated_at";
+const TICKET_COLS: &str = "id,item_id,issue_node_id,repo,number,title,body,url,labels,gh_status,gh_state,state,agent,parent,branch,pr_number,pr_url,attempts,review_rounds,feedback,note,cost_usd,updated_at,helpers";
 
 fn row_ticket(r: &Row) -> rusqlite::Result<Ticket> {
     let labels: String = r.get(8)?;
@@ -99,6 +100,7 @@ fn row_ticket(r: &Row) -> rusqlite::Result<Ticket> {
         note: r.get(20)?,
         cost_usd: r.get(21)?,
         updated_at: r.get(22)?,
+        helpers: serde_json::from_str(&r.get::<_, String>(23)?).unwrap_or_default(),
         deps: vec![],
     })
 }
@@ -137,6 +139,8 @@ impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // migrations (ignore "duplicate column" on already-migrated DBs)
+        let _ = conn.execute("ALTER TABLE tickets ADD COLUMN helpers TEXT NOT NULL DEFAULT '[]'", []);
         // Crash recovery: anything left "running" is retried.
         conn.execute("UPDATE runs SET status='interrupted', finished_at=?1 WHERE status='running'", [now()])?;
         conn.execute("UPDATE tickets SET state='ready' WHERE state='running'", [])?;
@@ -277,7 +281,7 @@ impl Db {
     /// Generic patch helper: `field` must be a known column.
     pub fn set_field<T: rusqlite::ToSql>(&self, id: i64, field: &str, v: T) -> Result<()> {
         const OK: &[&str] = &[
-            "agent", "parent", "branch", "pr_number", "pr_url", "attempts", "review_rounds", "feedback", "note", "gh_status",
+            "agent", "helpers", "parent", "branch", "pr_number", "pr_url", "attempts", "review_rounds", "feedback", "note", "gh_status",
         ];
         anyhow::ensure!(OK.contains(&field), "bad field");
         let c = self.conn.lock();

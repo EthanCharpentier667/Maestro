@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         project: Mutex::new(None),
         wake: Notify::new(),
         last_sync: Mutex::new(None),
+        repo_locks: Mutex::new(HashMap::new()),
     });
 
     tokio::spawn(engine::sync_loop(app.clone()));

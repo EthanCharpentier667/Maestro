@@ -48,6 +48,12 @@ fn slug(repo: &str) -> String {
 
 /// Local clone for a repo (user-provided path, or managed clone in data dir).
 pub async fn ensure_repo(app: &App, token: &str, repo: &str) -> Result<PathBuf> {
+    let lock = app.repo_lock(repo);
+    let _g = lock.lock().await;
+    ensure_repo_unlocked(app, token, repo).await
+}
+
+async fn ensure_repo_unlocked(app: &App, token: &str, repo: &str) -> Result<PathBuf> {
     let s = app.db.settings();
     if let Some(p) = s.repo_path(repo) {
         let p = PathBuf::from(p);
@@ -75,7 +81,9 @@ pub struct Workspace {
 
 pub async fn prepare(app: &App, token: &str, t: &Ticket, base: &str) -> Result<Workspace> {
     let s = app.db.settings();
-    let repo_dir = ensure_repo(app, token, &t.repo).await?;
+    let lock = app.repo_lock(&t.repo);
+    let _g = lock.lock().await;
+    let repo_dir = ensure_repo_unlocked(app, token, &t.repo).await?;
     let base_ref = format!("refs/maestro/base/{base}");
     git(&repo_dir, &["fetch", "--quiet", &auth_url(token, &t.repo), &format!("+refs/heads/{base}:{base_ref}")], &s).await?;
     let branch = t.branch.clone().unwrap_or_else(|| format!("maestro/{}-{}", t.number, title_slug(&t.title)));
@@ -122,6 +130,8 @@ pub async fn diff_stat(app: &App, ws: &Workspace) -> String {
 
 pub async fn cleanup(app: &App, t: &Ticket) {
     let s = app.db.settings();
+    let lock = app.repo_lock(&t.repo);
+    let _g = lock.lock().await;
     let wt = app.data.join("worktrees").join(slug(&t.repo)).join(t.number.to_string());
     if wt.exists() {
         let repo_dir = match s.repo_path(&t.repo) {

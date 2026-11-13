@@ -1,6 +1,6 @@
 //! HTTP API + SSE + embedded web UI.
 
-use crate::agents::{parse_agent, render_agent};
+use crate::agents::{parse_agent, parse_cell, render_agent, render_cell};
 use crate::app::AppRef;
 use crate::model::*;
 use crate::{claude, engine};
@@ -54,6 +54,8 @@ pub fn router(app: AppRef) -> Router {
         .route("/api/engine", post(engine_toggle))
         .route("/api/agents", get(agents))
         .route("/api/agents/{name}", put(put_agent).delete(del_agent))
+        .route("/api/cells", get(cells))
+        .route("/api/cells/{name}", put(put_cell).delete(del_cell))
         .route("/api/skills", get(skills))
         .route("/api/skills/{name}", put(put_skill).delete(del_skill))
         .route("/api/plan", post(plan))
@@ -76,6 +78,7 @@ async fn state(AxState(app): AxState<AppRef>) -> R {
     Ok(Json(json!({
         "tickets": app.db.tickets(),
         "agents": app.lib.agents(),
+        "cells": app.lib.cells(),
         "skills": app.lib.skills().iter().map(|s| json!({"name": s.name, "description": s.description})).collect::<Vec<_>>(),
         "settings": s.redacted(),
         "env_secrets": Settings::env_secrets(),
@@ -200,6 +203,23 @@ async fn put_agent(AxState(app): AxState<AppRef>, Path(name): Path<String>, Json
 
 async fn del_agent(AxState(app): AxState<AppRef>, Path(name): Path<String>) -> R {
     app.lib.delete_agent(&name)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn cells(AxState(app): AxState<AppRef>) -> R {
+    let v: Vec<Value> = app.lib.cells().iter().map(|c| json!({"cell": c, "raw": render_cell(c)})).collect();
+    Ok(Json(json!(v)))
+}
+
+async fn put_cell(AxState(app): AxState<AppRef>, Path(name): Path<String>, Json(b): Json<Value>) -> R {
+    let raw = b["raw"].as_str().ok_or_else(|| anyhow::anyhow!("missing raw"))?;
+    let c = parse_cell(raw)?;
+    app.lib.save_cell(&c, Some(&name))?;
+    Ok(Json(json!(c)))
+}
+
+async fn del_cell(AxState(app): AxState<AppRef>, Path(name): Path<String>) -> R {
+    app.lib.delete_cell(&name)?;
     Ok(Json(json!({"ok": true})))
 }
 

@@ -49,15 +49,23 @@ async function act(fn, okMsg) {
 }
 
 const agentOf = n => S.agents.find(a => a.name === n);
-const agentColor = n => agentOf(n)?.color || '#7c8799';
-function agentChip(n) { return n ? h('span', { class: 'agent-chip', style: `--ac:${agentColor(n)}` }, '◉ ', n) : null; }
+const cellOf = n => (S.cells || []).find(c => c.name === n);
+const agentColor = n => agentOf(n)?.color || cellOf(n)?.color || '#7c8799';
+const workersList = () => S.agents.filter(a => a.role !== 'orchestrator' && a.role !== 'reviewer');
+function agentChip(n) { return n ? h('span', { class: 'agent-chip', style: `--ac:${agentColor(n)}`, title: cellOf(n) ? `cell: ${[cellOf(n).lead, ...cellOf(n).members].filter(Boolean).join(', ')}` : 'agent' }, cellOf(n) ? '▣ ' : '◉ ', n) : null; }
+function assignees(t) { return [agentChip(t.agent), (t.helpers || []).map(x => h('span', { class: 'agent-chip', style: `--ac:${agentColor(x)}`, title: 'helper' }, '+ ', x))]; }
+function assigneeOptions(selected, emptyLabel) {
+  return [emptyLabel ? h('option', { value: '' }, emptyLabel) : null,
+    h('optgroup', { label: 'Agents' }, workersList().map(a => h('option', { value: a.name, selected: a.name === selected }, a.name))),
+    (S.cells || []).length ? h('optgroup', { label: 'Cells' }, S.cells.map(c => h('option', { value: c.name, selected: c.name === selected }, `${c.name} (${c.mode || 'delegate'})`))) : null];
+}
 function stateBadge(s) { return h('span', { class: 'pill state', style: `background:${sc(s)}` }, STATE_LABEL[s] || s); }
 
 // ───────── data
 async function load() {
   const d = await api('/api/state');
   S.tickets = new Map(d.tickets.map(t => [t.id, t]));
-  S.agents = d.agents; S.skills = d.skills; S.settings = d.settings; S.project = d.project; S.stats = d.stats;
+  S.agents = d.agents; S.cells = d.cells || []; S.skills = d.skills; S.settings = d.settings; S.project = d.project; S.stats = d.stats;
   S.envSecrets = d.env_secrets || []; S.sm = d.statemachine; S.runs = d.runs; S.busy = d.busy; S.lastSync = d.last_sync; S.claudeVersion = d.claude_version;
   renderChrome(); render();
 }
@@ -124,14 +132,14 @@ function render() {
 function filtered() {
   const { q, repo, agent } = S.filter;
   return [...S.tickets.values()].filter(t =>
-    (!q || (`#${t.number} ${t.title}`).toLowerCase().includes(q.toLowerCase())) && (!repo || t.repo === repo) && (!agent || t.agent === agent));
+    (!q || (`#${t.number} ${t.title}`).toLowerCase().includes(q.toLowerCase())) && (!repo || t.repo === repo) && (!agent || t.agent === agent || (t.helpers || []).includes(agent)));
 }
 function filterBar(extra = []) {
   const repos = [...new Set([...S.tickets.values()].map(t => t.repo))].sort();
   return h('div', { class: 'toolbar' },
     h('input', { placeholder: 'Search…', value: S.filter.q, oninput: e => { S.filter.q = e.target.value; clearTimeout(S._ft); S._ft = setTimeout(render, 200); } }),
     h('select', { onchange: e => { S.filter.repo = e.target.value; render(); } }, h('option', { value: '' }, 'All repos'), repos.map(r => h('option', { value: r, selected: r === S.filter.repo }, r))),
-    h('select', { onchange: e => { S.filter.agent = e.target.value; render(); } }, h('option', { value: '' }, 'All agents'), S.agents.map(a => h('option', { value: a.name, selected: a.name === S.filter.agent }, a.name))),
+    h('select', { onchange: e => { S.filter.agent = e.target.value; render(); } }, h('option', { value: '' }, 'All agents & cells'), [...S.agents, ...(S.cells || [])].map(a => h('option', { value: a.name, selected: a.name === S.filter.agent }, a.name))),
     ...extra);
 }
 
@@ -142,7 +150,7 @@ function ticketCard(t) {
     h('div', { class: 'meta' }, h('span', { class: 'num' }, `${t.repo.split('/')[1] || ''}#${t.number}`), stateBadge(t.state),
       running ? h('span', { class: 'spin' }) : null),
     h('div', { class: 't' }, t.title),
-    h('div', { class: 'meta' }, agentChip(t.agent),
+    h('div', { class: 'meta' }, assignees(t),
       t.deps.length ? h('span', { class: 'pill', title: 'dependencies' }, '⛓ ', t.deps.filter(d => S.tickets.get(d)?.state !== 'done').length, '/', t.deps.length) : null,
       t.pr_url ? h('a', { class: 'pill', href: t.pr_url, target: '_blank', onclick: e => e.stopPropagation() }, 'PR #', t.pr_number) : null,
       t.cost_usd ? h('span', { class: 'pill' }, money(t.cost_usd)) : null,
@@ -204,14 +212,17 @@ async function openTicket(id, refresh = false) {
       h('div', { style: 'display:flex;gap:6px' }, h('a', { class: 'btn sm', href: t.url, target: '_blank' }, 'Issue ↗'), t.pr_url ? h('a', { class: 'btn sm', href: t.pr_url, target: '_blank' }, `PR #${t.pr_number} ↗`) : null,
         h('button', { class: 'btn sm ghost', onclick: closeDrawer }, '✕'))),
     h('h2', {}, t.title),
-    h('div', { class: 'meta', style: 'display:flex;gap:6px;flex-wrap:wrap' }, agentChip(t.agent), t.labels.map(l => h('span', { class: 'pill' }, l)),
+    h('div', { class: 'meta', style: 'display:flex;gap:6px;flex-wrap:wrap' }, assignees(t), t.labels.map(l => h('span', { class: 'pill' }, l)),
       h('span', { class: 'pill' }, `attempts ${t.attempts}`), h('span', { class: 'pill' }, `reviews ${t.review_rounds}`), h('span', { class: 'pill' }, money(t.cost_usd)),
       t.branch ? h('span', { class: 'pill mono' }, '⎇ ', t.branch) : null),
     t.note ? h('div', { class: 'note', style: 'font-size:13px' }, t.note) : null,
     h('div', { class: 'actions' }, actions),
     h('div', { class: 'grid2' },
-      h('label', { class: 'f' }, h('span', {}, 'Agent'), h('select', { onchange: e => act(() => api(`/api/tickets/${id}/assign`, { method: 'POST', body: { agent: e.target.value } }), 'Assigned') },
-        h('option', { value: '' }, '— orchestrator decides —'), S.agents.filter(a => a.role !== 'orchestrator' && a.role !== 'reviewer').map(a => h('option', { value: a.name, selected: a.name === t.agent }, a.name)))),
+      h('div', {},
+        h('label', { class: 'f' }, h('span', {}, 'Assigned to (agent or cell)'), h('select', { onchange: e => act(() => api(`/api/tickets/${id}/assign`, { method: 'POST', body: { agent: e.target.value } }), 'Assigned') },
+          assigneeOptions(t.agent, '- orchestrator decides -'))),
+        h('label', { class: 'f' }, h('span', {}, 'Helpers (extra agents, ctrl/cmd-click)'), h('select', { multiple: true, size: 3, onchange: e => act(() => api(`/api/tickets/${id}/helpers`, { method: 'POST', body: { helpers: [...e.target.selectedOptions].map(o => o.value) } }), 'Helpers saved') },
+          workersList().map(a => h('option', { value: a.name, selected: (t.helpers || []).includes(a.name) }, a.name))))),
       h('label', { class: 'f' }, h('span', {}, 'Depends on (ctrl/cmd-click)'), h('select', { multiple: true, size: 4, onchange: e => act(() => api(`/api/tickets/${id}/deps`, { method: 'POST', body: { deps: [...e.target.selectedOptions].map(o => +o.value) } }), 'Dependencies saved') },
         others.map(o => h('option', { value: o.id, selected: t.deps.includes(o.id) }, `#${o.number} ${o.title.slice(0, 50)}`))))),
     h('div', { class: 'section' }, h('h4', {}, 'Description'), h('div', { class: 'body-md' }, t.body || '(empty)')),
@@ -286,7 +297,7 @@ function viewGraph() {
       h('svg:rect', { width: 5, height: H, rx: 2, fill: agentColor(t.agent) }),
       h('svg:text', { x: 14, y: 20, fill: '#6b7486', 'font-size': 11, 'font-family': 'monospace' }, `#${t.number} · ${STATE_LABEL[t.state]}`),
       h('svg:text', { x: 14, y: 38, fill: '#e6e9ef', 'font-size': 12.5 }, t.title.length > 30 ? t.title.slice(0, 29) + '…' : t.title),
-      h('svg:text', { x: 14, y: 54, fill: agentColor(t.agent), 'font-size': 11 }, t.agent ? `◉ ${t.agent}` : '○ unassigned'),
+      h('svg:text', { x: 14, y: 54, fill: agentColor(t.agent), 'font-size': 11 }, t.agent ? `${cellOf(t.agent) ? '▣' : '◉'} ${t.agent}${(t.helpers || []).length ? ` +${t.helpers.length}` : ''}` : '○ unassigned'),
       h('svg:title', {}, `#${t.number} ${t.title}`)));
   }
   const svg = h('svg:svg', {}, h('svg:defs', {}, h('svg:marker', { id: 'arr', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' }, h('svg:path', { d: 'M0,0 L10,5 L0,10 z', fill: '#4b5563' }))), g);
@@ -368,7 +379,6 @@ function flashTransition(e) {
 function viewPlanner() {
   const repos = [...new Set([...S.tickets.values()].map(t => t.repo))].sort();
   S.planRepo ||= repos[0] || '';
-  const workers = S.agents.filter(a => a.role !== 'orchestrator' && a.role !== 'reviewer');
   const box = h('div', {},
     h('div', { class: 'card' }, h('div', { class: 'h' }, h('h2', {}, '✦ Planner'), h('span', { class: 'muted small' }, 'The orchestrator turns a goal into a dependency graph of GitHub issues.')),
       h('label', { class: 'f' }, h('span', {}, 'Goal'), h('textarea', { id: 'goal', rows: 5, style: 'font-family:inherit', placeholder: 'e.g. Add a dash ability to the player: design doc with tuning, engine support for i-frames, gameplay implementation, VFX hook.' }, S.goal || '')),
@@ -382,11 +392,11 @@ function viewPlanner() {
     const tk = S.plan.tickets || [];
     box.append(h('div', { class: 'card', style: 'margin-top:14px' },
       h('div', { class: 'h' }, h('h3', {}, `${tk.length} tickets`), S.plan.summary ? h('span', { class: 'muted small' }, S.plan.summary) : null),
-      h('table', { class: 'plan-table' }, h('tr', {}, h('th', {}, 'Key'), h('th', { style: 'width:35%' }, 'Title / body'), h('th', {}, 'Agent'), h('th', {}, 'Depends on'), h('th', {})),
+      h('table', { class: 'plan-table' }, h('tr', {}, h('th', {}, 'Key'), h('th', { style: 'width:35%' }, 'Title / body'), h('th', {}, 'Agent / cell'), h('th', {}, 'Depends on'), h('th', {})),
         tk.map((t, i) => h('tr', {},
           h('td', { class: 'mono small' }, t.key),
           h('td', {}, h('input', { value: t.title, oninput: e => t.title = e.target.value, style: 'margin-bottom:6px' }), h('textarea', { oninput: e => t.body = e.target.value }, t.body)),
-          h('td', {}, h('select', { onchange: e => t.agent = e.target.value }, workers.map(a => h('option', { value: a.name, selected: a.name === t.agent }, a.name)))),
+          h('td', {}, h('select', { onchange: e => t.agent = e.target.value }, assigneeOptions(t.agent)), (t.helpers || []).length ? h('div', { class: 'muted small', style: 'margin-top:4px' }, '+ ', t.helpers.join(', ')) : null),
           h('td', { class: 'small mono' }, (t.depends_on || []).join(', ') || '—'),
           h('td', {}, h('button', { class: 'btn sm danger', onclick: () => { tk.splice(i, 1); render(); } }, '✕'))))),
       h('div', { class: 'actions' },
@@ -412,6 +422,18 @@ effort: ''
 
 You are a … Describe expertise, rules and conventions here.
 `;
+const CELL_TEMPLATE = `---
+name: new-cell
+description: What this group of agents is good at (used by the orchestrator for routing).
+lead: gamedev
+members: [gamedesign, engine]
+mode: delegate        # delegate = lead + members as subagents in one session | pipeline = lead, then each member in order
+color: '#eab308'
+labels: []
+---
+
+Instructions for the lead (delegate) or for every step (pipeline).
+`;
 const SKILL_TEMPLATE = n => `---
 name: ${n}
 description: When Claude should use this skill.
@@ -431,27 +453,36 @@ function viewAgents() {
       h('p', {}, a.description),
       h('div', { class: 'tags' }, h('span', { class: 'pill' }, '⚙ ', a.model || 'default'), a.labels.map(l => h('span', { class: 'pill' }, '🏷 ', l)), a.skills.map(s => h('span', { class: 'pill', style: 'border-color:#7c5cff66' }, '✦ ', s))),
       h('div', { class: 'muted small', style: 'margin-top:8px' }, `${st.n} runs · ${money(st.cost)}`)); })),
+    h('div', { class: 'h', style: 'margin-top:26px' }, h('h2', {}, 'Cells'), h('button', { class: 'btn', onclick: () => { S.editing = { kind: 'cell', name: null, raw: CELL_TEMPLATE }; render(); } }, '+ New cell')),
+    (S.cells || []).length ? h('div', { class: 'agents' }, S.cells.map(c => { const st = stat(c.name); return h('div', { class: 'acard', style: `--ac:${c.color || '#eab308'}`, onclick: () => editCell(c.name) },
+      h('div', { class: 'row' }, h('span', { class: 'dot', style: `background:${c.color || '#eab308'}` }), h('h3', {}, '▣ ', c.name), h('span', { class: 'pill', style: 'margin-left:auto' }, c.mode || 'delegate')),
+      h('p', {}, c.description),
+      h('div', { class: 'tags' }, c.lead ? h('span', { class: 'agent-chip', style: `--ac:${agentColor(c.lead)}` }, '★ ', c.lead) : null,
+        c.members.map(m => h('span', { class: 'agent-chip', style: `--ac:${agentColor(m)}` }, m)), c.labels.map(l => h('span', { class: 'pill' }, '🏷 ', l))),
+      h('div', { class: 'muted small', style: 'margin-top:8px' }, c.mode === 'pipeline' ? `order: ${[c.lead, ...c.members].filter(Boolean).join(' → ')}` : `${c.lead} delegates to ${c.members.join(', ') || 'nobody'}`)); }))
+      : h('div', { class: 'muted small' }, 'No cells yet. A cell groups agents that work together on the same ticket.'),
     h('div', { class: 'h', style: 'margin-top:26px' }, h('h2', {}, 'Skills'), h('button', { class: 'btn', onclick: () => { const n = prompt('Skill name (a-z, 0-9, -)'); if (n) { S.editing = { kind: 'skill', name: n, isNew: true, raw: SKILL_TEMPLATE(n) }; render(); } } }, '+ New skill')),
     h('div', { class: 'agents' }, S.skills.map(s => h('div', { class: 'acard', style: '--ac:#7c5cff', onclick: () => editSkill(s.name) },
       h('div', { class: 'row' }, h('h3', {}, '✦ ', s.name)), h('p', {}, s.description),
       h('div', { class: 'muted small' }, 'used by: ', S.agents.filter(a => a.skills.includes(s.name)).map(a => a.name).join(', ') || '—')))));
 }
 async function editAgent(name) { const list = await api('/api/agents'); const x = list.find(v => v.agent.name === name); S.editing = { kind: 'agent', name, raw: x.raw }; render(); }
+async function editCell(name) { const list = await api('/api/cells'); const x = list.find(v => v.cell.name === name); S.editing = { kind: 'cell', name, raw: x.raw }; render(); }
 async function editSkill(name) { const list = await api('/api/skills'); const x = list.find(v => v.name === name); S.editing = { kind: 'skill', name, raw: x.content }; render(); }
 function agentEditor() {
-  const e = S.editing, isAgent = e.kind === 'agent';
+  const e = S.editing, isAgent = e.kind === 'agent', isCell = e.kind === 'cell';
   const ta = h('textarea', { spellcheck: 'false', oninput: ev => e.raw = ev.target.value }, e.raw);
   const save = () => act(async () => {
-    if (isAgent) {
+    if (isAgent || isCell) {
       const nm = (e.raw.match(/^name:\s*(.+)$/m) || [])[1]?.trim().replace(/^['"]|['"]$/g, '');
       if (!nm) throw new Error('front-matter needs a name');
-      await api(`/api/agents/${encodeURIComponent(e.name || nm)}`, { method: 'PUT', body: { raw: e.raw } });
+      await api(`/api/${isCell ? 'cells' : 'agents'}/${encodeURIComponent(e.name || nm)}`, { method: 'PUT', body: { raw: e.raw } });
     } else await api(`/api/skills/${encodeURIComponent(e.name)}`, { method: 'PUT', body: { content: e.raw } });
     S.editing = null; await load();
   }, 'Saved');
-  const del = () => { if (confirm(`Delete ${e.kind} ${e.name}?`)) act(async () => { await api(`/api/${isAgent ? 'agents' : 'skills'}/${encodeURIComponent(e.name)}`, { method: 'DELETE' }); S.editing = null; await load(); }, 'Deleted'); };
+  const del = () => { if (confirm(`Delete ${e.kind} ${e.name}?`)) act(async () => { await api(`/api/${isAgent ? 'agents' : isCell ? 'cells' : 'skills'}/${encodeURIComponent(e.name)}`, { method: 'DELETE' }); S.editing = null; await load(); }, 'Deleted'); };
   return h('div', {},
-    h('div', { class: 'h' }, h('h2', {}, isAgent ? (e.name ? `Agent · ${e.name}` : 'New agent') : `Skill · ${e.name}`),
+    h('div', { class: 'h' }, h('h2', {}, isAgent ? (e.name ? `Agent · ${e.name}` : 'New agent') : isCell ? (e.name ? `Cell · ${e.name}` : 'New cell') : `Skill · ${e.name}`),
       h('div', { style: 'display:flex;gap:6px' }, e.name && !e.isNew ? h('button', { class: 'btn danger', onclick: del }, 'Delete') : null,
         h('button', { class: 'btn ghost', onclick: () => { S.editing = null; render(); } }, 'Cancel'), h('button', { class: 'btn primary', onclick: save }, 'Save'))),
     h('div', { class: 'editor' }, ta,
@@ -464,6 +495,13 @@ function agentEditor() {
         h('p', {}, h('code', {}, 'skills'), ': skills from the library, mounted through a generated Claude Code plugin (', h('code', {}, '--plugin-dir'), ').'),
         h('p', {}, 'The markdown body is appended to Claude Code\'s system prompt.'),
         h('p', {}, 'Skills available: ', S.skills.map(s => h('code', { style: 'margin:2px' }, s.name)))
+      ] : isCell ? [
+        h('h3', {}, 'Cell'),
+        h('p', {}, 'A cell is a group of agents assigned to a ticket as one unit. Assign it like an agent (drawer, planner, ', h('code', {}, 'cell:<name>'), ' label, or the orchestrator).'),
+        h('p', {}, h('code', {}, 'mode: delegate'), ': the ', h('code', {}, 'lead'), ' runs one Claude Code session where the ', h('code', {}, 'members'), ' are declared as subagents (', h('code', {}, '--agents'), '). The lead delegates and integrates. Skills of all members are mounted.'),
+        h('p', {}, h('code', {}, 'mode: pipeline'), ': lead, then each member in order, one session each, on the same branch. Each step gets the previous summaries.'),
+        h('p', {}, h('code', {}, 'labels'), ': GitHub labels routed to this cell.'),
+        h('p', {}, 'Agents available: ', workersList().map(a => h('code', { style: 'margin:2px' }, a.name))),
       ] : [h('h3', {}, 'Skill'), h('p', {}, 'Standard Claude Code SKILL.md: front-matter ', h('code', {}, 'name'), ' + ', h('code', {}, 'description'), ' (tells Claude when to load it), then instructions. Attach it to agents via their ', h('code', {}, 'skills'), ' list.')])));
 }
 

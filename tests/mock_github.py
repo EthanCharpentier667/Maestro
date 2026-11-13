@@ -20,6 +20,8 @@ def add_issue(title, body, status="Backlog", labels=()):
 
 add_issue("Player can dash", "Add a dash ability with cooldown.", "Todo")
 add_issue("Main menu", "Depends on #1\nSimple main menu.", "Backlog")
+add_issue("Jump pad", "Bouncy pad that launches the player.", "Todo", ["cell:gameplay-squad"])
+add_issue("Double jump", "Second jump in mid-air.", "Todo", ["cell:feature-pipeline"])
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass

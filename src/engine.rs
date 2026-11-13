@@ -5,7 +5,7 @@
 //!  - worker      : specialist agent codes in an isolated worktree → PR
 //!  - review      : reviewer agent approves or sends feedback (loop)
 
-use crate::agents::Agent;
+use crate::agents::{Agent, Team};
 use crate::app::{App, AppRef};
 use crate::claude::{self, Request};
 use crate::db::SyncedItem;
@@ -67,21 +67,42 @@ fn deps_done(app: &App, t: &Ticket) -> bool {
 }
 
 fn roster(app: &App) -> String {
-    app.lib
+    let mut out = app
+        .lib
         .workers()
         .iter()
-        .map(|a| format!("- `{}` — {} (labels: {})", a.meta.name, a.meta.description, a.meta.labels.join(", ")))
+        .map(|a| format!("- agent `{}` — {} (labels: {})", a.meta.name, a.meta.description, a.meta.labels.join(", ")))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    let cells = app.lib.cells();
+    if !cells.is_empty() {
+        out.push_str("\n\nCells (groups of agents working together on one ticket; assign by cell name):\n");
+        for c in cells {
+            out.push_str(&format!(
+                "- cell `{}` ({}: lead {}, members {}) — {}\n",
+                c.meta.name,
+                if c.meta.mode == "pipeline" { "pipeline" } else { "delegate" },
+                c.meta.lead,
+                c.meta.members.join(", "),
+                c.meta.description
+            ));
+        }
+    }
+    out
 }
 
 fn label_agent(app: &App, t: &Ticket) -> Option<String> {
     let workers = app.lib.workers();
     for l in &t.labels {
-        if let Some(n) = l.strip_prefix("agent:") {
-            if workers.iter().any(|a| a.meta.name == n) {
+        if let Some(n) = l.strip_prefix("agent:").or_else(|| l.strip_prefix("cell:")) {
+            if app.lib.is_assignable(n) {
                 return Some(n.to_string());
             }
+        }
+    }
+    for c in app.lib.cells() {
+        if t.labels.iter().any(|l| c.meta.labels.iter().any(|x| x.eq_ignore_ascii_case(l))) {
+            return Some(c.meta.name);
         }
     }
     for a in &workers {
@@ -258,12 +279,15 @@ fn triage_schema() -> Value {
       "type": "object",
       "properties": {
         "decision": {"type": "string", "enum": ["assign", "split", "clarify"]},
-        "agent": {"type": "string", "description": "agent name when decision=assign"},
+        "agent": {"type": "string", "description": "agent or cell name when decision=assign"},
+        "helpers": {"type": "array", "items": {"type": "string"}, "description": "optional extra agents that work with the assignee"},
         "reason": {"type": "string"},
         "question": {"type": "string", "description": "question for the human when decision=clarify"},
         "subtasks": {"type": "array", "items": {"type": "object", "properties": {
             "key": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"},
-            "agent": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}}
+            "agent": {"type": "string", "description": "agent or cell name"},
+            "helpers": {"type": "array", "items": {"type": "string"}},
+            "depends_on": {"type": "array", "items": {"type": "string"}}
         }, "required": ["key", "title", "body", "agent"]}}
       },
       "required": ["decision", "reason"]
@@ -277,7 +301,9 @@ fn plan_schema() -> Value {
         "summary": {"type": "string"},
         "tickets": {"type": "array", "items": {"type": "object", "properties": {
             "key": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"},
-            "agent": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}}
+            "agent": {"type": "string", "description": "agent or cell name"},
+            "helpers": {"type": "array", "items": {"type": "string"}},
+            "depends_on": {"type": "array", "items": {"type": "string"}}
         }, "required": ["key", "title", "body", "agent"]}}
       },
       "required": ["tickets"]
@@ -325,7 +351,7 @@ async fn triage(app: &AppRef, id: i64) -> Result<()> {
     let prompt = format!(
         "You are triaging a ticket from the GitHub Project board.\n\n## Team (worker agents)\n{}\n\n## Ticket {}#{}: {}\nLabels: {}\n\n{}\n\n## Comments\n{}\n\n\
          The current directory is the repository; you may inspect it (read-only) to judge scope.\n\
-         Decide:\n- `assign`: one agent can do it in a single focused PR → give `agent`.\n\
+         Decide:\n- `assign`: it fits a single focused PR → give `agent` (an agent or a cell). Use a cell, or add `helpers`, when the PR needs several specialities working together.\n\
          - `split`: too big or spans several specialities → give 2-8 `subtasks` (each one PR-sized, with `agent` and `depends_on` keys of other subtasks).\n\
          - `clarify`: the ticket is too ambiguous to act on → give a precise `question`.\n\
          Answer ONLY with the JSON object.",
@@ -334,7 +360,7 @@ async fn triage(app: &AppRef, id: i64) -> Result<()> {
     );
     let cwd = orchestrator_cwd(app, &t.repo).await;
     let plugin = app.lib.build_plugin(&orch)?;
-    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(triage_schema()), plugin_dir: plugin, tools: None, read_only: true }).await?;
+    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(triage_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None }).await?;
     app.db.add_cost(id, out.cost);
     let fin = app.db.finish_run(run.id, if out.ok { "success" } else { "failed" }, out.cost, out.turns, out.session_id.as_deref(), &out.text);
     if let Some(r) = fin {
@@ -347,13 +373,16 @@ async fn triage(app: &AppRef, id: i64) -> Result<()> {
     let d = out.structured.filter(|_| out.ok).ok_or_else(|| anyhow!("orchestrator returned no decision: {}", out.text))?;
     let reason = d["reason"].as_str().unwrap_or("").to_string();
     let workers = app.lib.workers();
-    let valid = |n: &str| workers.iter().any(|a| a.meta.name == n);
+    let _ = &workers;
+    let valid = |n: &str| app.lib.is_assignable(n);
 
     match d["decision"].as_str().unwrap_or("") {
         "assign" => {
             let agent = d["agent"].as_str().unwrap_or("");
             anyhow::ensure!(valid(agent), "orchestrator picked unknown agent '{agent}'");
             app.db.set_field(id, "agent", agent)?;
+            let helpers = valid_helpers(app, &d["helpers"]);
+            app.db.set_field(id, "helpers", serde_json::to_string(&helpers)?)?;
             let to = if deps_done(app, &t) { State::Ready } else { State::Blocked };
             app.transition(id, to, &format!("orchestrator → {agent}"));
             gh_comment(app, &gh, &t, &format!("🎼 **Maestro** — routed to **`{agent}`**\n\n> {reason}")).await;
@@ -389,9 +418,10 @@ pub async fn create_tickets(app: &App, gh: &Github, repo: &str, items: &[Value],
     for it in items {
         let key = it["key"].as_str().unwrap_or("").to_string();
         let mut agent = it["agent"].as_str().unwrap_or("").to_string();
-        if !workers.iter().any(|a| a.meta.name == agent) {
+        if !app.lib.is_assignable(&agent) {
             agent = workers.first().map(|a| a.meta.name.clone()).unwrap_or_default();
         }
+        let helpers = valid_helpers(app, &it["helpers"]);
         let deps: Vec<String> = it["depends_on"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
         let mut body = it["body"].as_str().unwrap_or("").to_string();
         let dep_nums: Vec<String> = deps.iter().filter_map(|k| key_to_num.get(k)).map(|n| format!("#{n}")).collect();
@@ -402,8 +432,9 @@ pub async fn create_tickets(app: &App, gh: &Github, repo: &str, items: &[Value],
         if !dep_nums.is_empty() {
             body.push_str(&format!("Depends on {}\n", dep_nums.join(", ")));
         }
-        body.push_str(&format!("_Created by Maestro orchestrator — agent: `{agent}`_"));
-        let labels = vec![format!("agent:{agent}")];
+        body.push_str(&format!("_Created by Maestro orchestrator — assigned to `{agent}`_"));
+        let kind = if app.lib.cell(&agent).is_some() { "cell" } else { "agent" };
+        let labels = vec![format!("{kind}:{agent}")];
         let title = it["title"].as_str().unwrap_or("Untitled").to_string();
         let (num, url, item_id) = gh.create_issue(&project, repo, &title, &body, &labels).await?;
         let col = if start { s.col_trigger.clone() } else { String::new() };
@@ -423,6 +454,7 @@ pub async fn create_tickets(app: &App, gh: &Github, repo: &str, items: &[Value],
             gh_state: "OPEN".into(),
         })?;
         app.db.set_field(t.id, "agent", &agent)?;
+        app.db.set_field(t.id, "helpers", serde_json::to_string(&helpers)?)?;
         if let Some(p) = parent {
             app.db.set_field(t.id, "parent", p.id)?;
         }
@@ -466,12 +498,24 @@ pub async fn plan(app: &AppRef, goal: &str, repo: &str) -> Result<Value> {
     );
     let cwd = orchestrator_cwd(app, repo).await;
     let plugin = app.lib.build_plugin(&orch)?;
-    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(plan_schema()), plugin_dir: plugin, tools: None, read_only: true }).await?;
+    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(plan_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None }).await?;
     if let Some(r) = app.db.finish_run(run.id, if out.ok { "success" } else { "failed" }, out.cost, out.turns, out.session_id.as_deref(), &out.text) {
         app.emit(Event::Run { run: r });
     }
     let v = out.structured.filter(|_| out.ok).ok_or_else(|| anyhow!("planner failed: {}", out.text))?;
     Ok(json!({"run_id": run.id, "plan": v}))
+}
+
+fn valid_helpers(app: &App, v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .filter(|n| app.lib.workers().iter().any(|w| w.meta.name == *n))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ───────────────────────────── worker + review
@@ -492,8 +536,9 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
     let s = app.db.settings();
     let gh = app.github().await?;
     let t0 = app.db.ticket(id).context("ticket gone")?;
-    let agent_name = t0.agent.clone().context("no agent assigned")?;
-    let agent = app.lib.agent(&agent_name).ok_or_else(|| anyhow!("agent '{agent_name}' not found"))?;
+    let assignee = t0.agent.clone().context("no agent assigned")?;
+    let team = app.lib.team(&assignee, &t0.helpers)?;
+    let agent_name = team.name.clone();
     let base = if s.base_branch.trim().is_empty() { gh.default_branch(&t0.repo).await.unwrap_or_else(|_| "main".into()) } else { s.base_branch.clone() };
 
     app.transition(id, State::Running, &format!("{agent_name} started"));
@@ -532,14 +577,7 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
             feedback
         );
 
-        let run = app.db.create_run(Some(id), "work", &agent_name)?;
-        app.emit(Event::Run { run: run.clone() });
-        let plugin = app.lib.build_plugin(&agent)?;
-        let out = claude::run(app, Request { run_id: run.id, cwd: &ws.path, agent: &agent, prompt, json_schema: None, plugin_dir: plugin, tools: None, read_only: false }).await?;
-        app.db.add_cost(id, out.cost);
-        if let Some(r) = app.db.finish_run(run.id, if out.cancelled { "cancelled" } else if out.ok { "success" } else { "failed" }, out.cost, out.turns, out.session_id.as_deref(), &out.text) {
-            app.emit(Event::Run { run: r });
-        }
+        let out = run_team(app, id, &team, &ws.path, prompt).await?;
         if out.cancelled {
             app.transition(id, State::Paused, "cancelled by user");
             return Ok(());
@@ -595,7 +633,7 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
             t.number, t.title, t.body, ws.base_ref, ws.base_ref
         );
         let plugin = app.lib.build_plugin(&reviewer)?;
-        let rout = claude::run(app, Request { run_id: rrun.id, cwd: &ws.path, agent: &reviewer, prompt: rprompt, json_schema: Some(review_schema()), plugin_dir: plugin, tools: None, read_only: true }).await?;
+        let rout = claude::run(app, Request { run_id: rrun.id, cwd: &ws.path, agent: &reviewer, prompt: rprompt, json_schema: Some(review_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None }).await?;
         app.db.add_cost(id, rout.cost);
         if let Some(r) = app.db.finish_run(rrun.id, if rout.ok { "success" } else { "failed" }, rout.cost, rout.turns, rout.session_id.as_deref(), &rout.text) {
             app.emit(Event::Run { run: r });
@@ -634,6 +672,97 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
         app.db.set_field(id, "feedback", format!("{summary}\n\n{}", issues.iter().map(|i| format!("- {i}")).collect::<Vec<_>>().join("\n")))?;
         app.transition(id, State::Running, "changes requested");
         // loop: same worktree, agent fixes the feedback, push updates the PR
+    }
+}
+
+/// Run a team on a ticket's worktree.
+///  - single agent / delegate: one Claude session; members are declared as subagents.
+///  - pipeline: lead then members, one session each, summaries passed along.
+async fn run_team(app: &App, ticket: i64, team: &Team, cwd: &std::path::Path, prompt: String) -> Result<claude::Outcome> {
+    if !team.pipeline {
+        let mut prompt = prompt;
+        let mut subagents = None;
+        if !team.members.is_empty() {
+            let mut defs = serde_json::Map::new();
+            for m in &team.members {
+                let mut d = json!({"description": m.meta.description, "prompt": m.prompt});
+                if !m.meta.tools.is_empty() {
+                    d["tools"] = json!(m.meta.tools);
+                }
+                if !m.meta.model.is_empty() && m.meta.model != "inherit" {
+                    d["model"] = json!(m.meta.model);
+                }
+                defs.insert(m.meta.name.clone(), d);
+            }
+            let dir = app.data.join("plugins");
+            std::fs::create_dir_all(&dir)?;
+            let f = dir.join(format!("team-{}-{ticket}.agents.json", team.name));
+            std::fs::write(&f, serde_json::to_string_pretty(&Value::Object(defs))?)?;
+            subagents = Some(f);
+            prompt.push_str(&format!(
+                "\n\n## Your team\nYou lead `{}`. Delegate with the Task tool to these subagents (same repository), then integrate their work:\n{}\n",
+                team.name,
+                team.members.iter().map(|m| format!("- `{}`: {}", m.meta.name, m.meta.description)).collect::<Vec<_>>().join("\n")
+            ));
+        }
+        if !team.instructions.trim().is_empty() {
+            prompt.push_str(&format!("\n## Team instructions\n{}\n", team.instructions.trim()));
+        }
+        let run = app.db.create_run(Some(ticket), "work", &team.lead.meta.name)?;
+        app.emit(Event::Run { run: run.clone() });
+        if !team.members.is_empty() {
+            app.log(run.id, "system", &format!("team {} · lead {} · members {}", team.name, team.lead.meta.name, team.members.iter().map(|m| m.meta.name.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        let plugin = app.lib.build_team_plugin(team)?;
+        let out = claude::run(app, Request { run_id: run.id, cwd, agent: &team.lead, prompt, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents }).await?;
+        finish(app, ticket, run.id, &out);
+        return Ok(out);
+    }
+
+    // pipeline
+    let steps: Vec<&Agent> = std::iter::once(&team.lead).chain(team.members.iter()).collect();
+    let n = steps.len();
+    let mut total = claude::Outcome { ok: true, ..Default::default() };
+    let mut summaries: Vec<String> = vec![];
+    for (i, agent) in steps.into_iter().enumerate() {
+        let mut p = prompt.clone();
+        p.push_str(&format!("\n\n## Pipeline `{}` — step {}/{} (you are `{}`)\n", team.name, i + 1, n, agent.meta.name));
+        if summaries.is_empty() {
+            p.push_str("You are the first step. Do your part only; later steps will build on your commits.\n");
+        } else {
+            p.push_str("Previous steps (their commits are already on this branch):\n");
+            p.push_str(&summaries.join("\n\n"));
+            p.push('\n');
+        }
+        if !team.instructions.trim().is_empty() {
+            p.push_str(&format!("\n## Team instructions\n{}\n", team.instructions.trim()));
+        }
+        let run = app.db.create_run(Some(ticket), "work", &agent.meta.name)?;
+        app.emit(Event::Run { run: run.clone() });
+        app.log(run.id, "system", &format!("pipeline {} · step {}/{}", team.name, i + 1, n));
+        let plugin = app.lib.build_plugin(agent)?;
+        let out = claude::run(app, Request { run_id: run.id, cwd, agent, prompt: p, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents: None }).await?;
+        finish(app, ticket, run.id, &out);
+        total.cost += out.cost;
+        total.turns += out.turns;
+        total.session_id = out.session_id.clone();
+        summaries.push(format!("### Step {} — {}\n{}", i + 1, agent.meta.name, out.text));
+        if out.cancelled || !out.ok {
+            total.ok = false;
+            total.cancelled = out.cancelled;
+            total.text = format!("step {} ({}) failed: {}", i + 1, agent.meta.name, out.text);
+            return Ok(total);
+        }
+    }
+    total.text = summaries.join("\n\n");
+    Ok(total)
+}
+
+fn finish(app: &App, ticket: i64, run_id: i64, out: &claude::Outcome) {
+    app.db.add_cost(ticket, out.cost);
+    let status = if out.cancelled { "cancelled" } else if out.ok { "success" } else { "failed" };
+    if let Some(r) = app.db.finish_run(run_id, status, out.cost, out.turns, out.session_id.as_deref(), &out.text) {
+        app.emit(Event::Run { run: r });
     }
 }
 
@@ -701,13 +830,18 @@ pub async fn action(app: &AppRef, id: i64, action: &str, body: &Value) -> Result
         }
         "assign" => {
             let a = body["agent"].as_str().unwrap_or("");
-            anyhow::ensure!(app.lib.agent(a).is_some(), "unknown agent");
+            anyhow::ensure!(app.lib.is_assignable(a), "unknown agent or cell");
             app.db.set_field(id, "agent", a)?;
             if matches!(t.state, State::Backlog | State::Triage | State::NeedsHuman | State::Paused) {
                 app.db.set_state(id, t.state, State::Ready, &format!("human → {a}"))?;
             }
             app.emit_ticket(id);
             app.wake.notify_one();
+        }
+        "helpers" => {
+            let h = valid_helpers(app, &body["helpers"]);
+            app.db.set_field(id, "helpers", serde_json::to_string(&h)?)?;
+            app.emit_ticket(id);
         }
         "deps" => {
             let deps: Vec<i64> = body["deps"].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();

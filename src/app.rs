@@ -22,11 +22,17 @@ pub struct App {
     pub project: Mutex<Option<ProjectInfo>>,
     pub wake: Notify,
     pub last_sync: Mutex<Option<(String, Option<String>)>>,
+    /// One async lock per repository: serialises clone / fetch / worktree ops.
+    pub repo_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 pub type AppRef = Arc<App>;
 
 impl App {
+    pub fn repo_lock(&self, repo: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.repo_locks.lock().entry(repo.to_lowercase()).or_default().clone()
+    }
+
     pub fn emit(&self, e: Event) {
         let _ = self.events.send(e);
     }

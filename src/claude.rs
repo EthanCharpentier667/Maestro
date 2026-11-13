@@ -39,6 +39,8 @@ pub struct Request<'a> {
     pub tools: Option<Vec<String>>,
     /// Orchestrator / reviewer: may read the repo but never edit it.
     pub read_only: bool,
+    /// JSON file defining Claude Code subagents (`--agents`), for delegate teams.
+    pub subagents: Option<std::path::PathBuf>,
 }
 
 pub fn base_command(s: &Settings) -> Command {
@@ -117,7 +119,18 @@ pub async fn run(app: &App, req: Request<'_>) -> Result<Outcome> {
     if !req.agent.meta.effort.is_empty() {
         cmd.args(["--effort", &req.agent.meta.effort]);
     }
-    let tools = req.tools.clone().unwrap_or_else(|| req.agent.meta.tools.clone());
+    let mut tools = req.tools.clone().unwrap_or_else(|| req.agent.meta.tools.clone());
+    if let Some(f) = &req.subagents {
+        cmd.arg("--agents").arg(f);
+        // the lead must be able to spawn its teammates
+        if !tools.is_empty() {
+            for t in ["Task", "Agent"] {
+                if !tools.iter().any(|x| x == t) {
+                    tools.push(t.into());
+                }
+            }
+        }
+    }
     if !tools.is_empty() {
         cmd.arg("--allowedTools").arg(tools.join(","));
     }

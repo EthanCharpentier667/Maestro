@@ -2,6 +2,7 @@
 # Fake `claude` CLI emitting stream-json, role detected from --json-schema. For e2e tests only.
 [ "$1" = "--version" ] && { echo "0.0.0 (fake)"; exit 0; }
 ARGS="$*"; PROMPT=$(cat)
+[ -n "$FAKE_CLAUDE_LOG" ] && printf "%s\n" "$ARGS" | head -c 300 >> "$FAKE_CLAUDE_LOG" && echo >> "$FAKE_CLAUDE_LOG"
 emit(){ echo "$1"; }
 emit '{"type":"system","subtype":"init","session_id":"s1","model":"fake","tools":["Read"]}'
 if [[ "$ARGS" == *'"decision"'* ]]; then

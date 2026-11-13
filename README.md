@@ -3,8 +3,8 @@
 Maestro turns a GitHub Project (V2) board into a team of AI agents.
 
 Move a card into the trigger column and an orchestrator agent triages it: it either assigns the ticket to a
-specialist (engine, gameplay, game design, devops...), splits it into sub-tickets with dependencies, or asks
-a clarifying question. Each specialist works in its own git worktree using Claude Code on your machine, Maestro
+specialist (engine, gameplay, game design, devops...) or to a cell (a group of agents), splits it into
+sub-tickets with dependencies, or asks a clarifying question. Each specialist works in its own git worktree using Claude Code on your machine, Maestro
 pushes the branch and opens a pull request, a reviewer agent checks it (and sends it back for fixes if needed),
 and the board columns are kept in sync along the way.
 
@@ -79,7 +79,7 @@ backlog -> triage -> ready | blocked | split | needs_human
 ready -> running -> reviewing <-> running -> awaiting_merge -> done
 ```
 
-- **triage**: tickets with an `agent:<name>` label, or a label listed by an agent, go straight to that agent.
+- **triage**: tickets with an `agent:<name>` or `cell:<name>` label, or a label listed by an agent or cell, skip the orchestrator.
   Otherwise the orchestrator decides: `assign`, `split` (sub-tickets with `depends_on`), or `clarify`
   (it posts a question on the issue).
 - **blocked**: waiting for dependencies to reach `done`. Dependencies are parsed from issue bodies
@@ -114,7 +114,37 @@ Appended to Claude Code's system prompt.
 Skills are standard Claude Code `SKILL.md` folders in `maestro-data/skills/`. For each agent, Maestro generates a
 Claude Code plugin containing only that agent's skills and loads it with `--plugin-dir`.
 
+There is no limit on the number of agents or skills, and an agent can use any number of skills. The number of
+tickets worked on at the same time is set by "Parallel agents" in Settings.
+
 Default team: `orchestrator`, `engine`, `gamedev`, `gamedesign`, `devops`, `reviewer`.
+
+### Several agents on one ticket
+
+A ticket is assigned to an agent or a cell, and can also get **helpers**: extra agents picked in the ticket panel
+(the orchestrator can add them too).
+
+A **cell** is a reusable group of agents, stored in `maestro-data/cells/`:
+
+```markdown
+---
+name: gameplay-squad
+description: Gameplay feature squad.      # used by the orchestrator for routing
+lead: gamedev
+members: [gamedesign, engine]
+mode: delegate                             # delegate | pipeline
+labels: [squad]                            # GitHub labels routed to this cell
+---
+Instructions for the lead (delegate) or for every step (pipeline).
+```
+
+- `delegate`: one Claude Code session for the lead, with the members (and helpers) declared as Claude Code
+  subagents through `--agents`. The lead delegates with the Task tool and integrates the result. The skills of
+  every member are mounted.
+- `pipeline`: the lead, then each member in order, one session each on the same branch. Every step receives the
+  summaries of the previous ones. If a step fails, the attempt fails.
+
+Default cells: `gameplay-squad` (delegate) and `feature-pipeline` (gamedesign then gamedev).
 
 ### Planner
 
@@ -147,6 +177,7 @@ src/
   api.rs       HTTP API, SSE, embedded UI
 web/           index.html, app.js, style.css (plain JS, no build step)
 agents/        default agents (copied to maestro-data on first start)
+cells/         default cells
 skills/        default skills
 tests/         GitHub mock and fake `claude` CLI for end-to-end tests
 ```

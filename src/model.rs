@@ -127,7 +127,10 @@ pub struct Ticket {
     pub gh_status: String,
     pub gh_state: String,
     pub state: State,
+    /// Agent or cell name.
     pub agent: Option<String>,
+    /// Extra agents working with the assignee on this ticket.
+    pub helpers: Vec<String>,
     pub parent: Option<i64>,
     pub branch: Option<String>,
     pub pr_number: Option<i64>,
