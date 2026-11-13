@@ -42,6 +42,8 @@ pub fn router(app: AppRef) -> Router {
         .route("/api/state", get(state))
         .route("/api/events", get(events))
         .route("/api/statemachine", get(statemachine))
+        .route("/mcp", post(crate::mcp::post).get(crate::mcp::get))
+        .route("/api/tickets", post(create_ticket))
         .route("/api/tickets/{id}", get(ticket))
         .route("/api/tickets/{id}/{action}", post(ticket_action))
         .route("/api/runs", get(runs))
@@ -89,6 +91,7 @@ async fn state(AxState(app): AxState<AppRef>) -> R {
         "busy": busy,
         "last_sync": last_sync.map(|(ts, err)| json!({"ts": ts, "error": err})),
         "claude_version": claude::version(&s).await,
+        "mcp": {"url": format!("{}/mcp", app.base_url), "token": app.db.mcp_token()},
     })))
 }
 
@@ -105,6 +108,24 @@ async fn statemachine() -> Json<Value> {
 async fn ticket(AxState(app): AxState<AppRef>, Path(id): Path<i64>) -> R {
     let t = app.db.ticket(id).ok_or_else(|| anyhow::anyhow!("not found"))?;
     Ok(Json(json!({"ticket": t, "transitions": app.db.transitions(id), "runs": app.db.runs(Some(id), 50)})))
+}
+
+async fn create_ticket(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
+    let gh = app.github().await?;
+    let strs = |k: &str| -> Vec<String> { b[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default() };
+    let t = engine::create_one(&app, &gh, engine::NewTicket {
+        repo: b["repo"].as_str().unwrap_or("").trim().into(),
+        title: b["title"].as_str().unwrap_or("").into(),
+        body: b["body"].as_str().unwrap_or("").into(),
+        assignee: b["agent"].as_str().map(String::from),
+        helpers: strs("helpers"),
+        deps: b["deps"].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default(),
+        related: None,
+        start: b["start"].as_bool().unwrap_or(false),
+        created_by: "Maestro UI".into(),
+    })
+    .await?;
+    Ok(Json(json!(t)))
 }
 
 async fn ticket_action(AxState(app): AxState<AppRef>, Path((id, action)): Path<(i64, String)>, body: Option<Json<Value>>) -> R {

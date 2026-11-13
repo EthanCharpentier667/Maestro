@@ -228,7 +228,8 @@ async fn tick(app: &AppRef) {
                     app.transition(t.id, State::Done, "all sub-tickets done");
                     if let Ok(gh) = app.github().await {
                         set_gh_status(app, &gh, t, &s.col_done).await;
-                        gh_comment(app, &gh, t, "🎼 **Maestro** — all sub-tickets are done ✅").await;
+                        gh_comment(app, &gh, t, "**Maestro**: all sub-tickets are done.").await;
+                        let _ = gh.set_issue_state(&t.repo, t.number, "closed", "completed").await;
                     }
                 }
             }
@@ -360,7 +361,7 @@ async fn triage(app: &AppRef, id: i64) -> Result<()> {
     );
     let cwd = orchestrator_cwd(app, &t.repo).await;
     let plugin = app.lib.build_plugin(&orch)?;
-    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(triage_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None }).await?;
+    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(triage_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None }).await?;
     app.db.add_cost(id, out.cost);
     let fin = app.db.finish_run(run.id, if out.ok { "success" } else { "failed" }, out.cost, out.turns, out.session_id.as_deref(), &out.text);
     if let Some(r) = fin {
@@ -477,6 +478,92 @@ pub async fn create_tickets(app: &App, gh: &Github, repo: &str, items: &[Value],
     Ok(out)
 }
 
+/// Options for creating a single ticket (UI, MCP).
+pub struct NewTicket {
+    pub repo: String,
+    pub title: String,
+    pub body: String,
+    pub assignee: Option<String>,
+    pub helpers: Vec<String>,
+    /// local ticket ids
+    pub deps: Vec<i64>,
+    pub related: Option<i64>,
+    pub start: bool,
+    pub created_by: String,
+}
+
+pub async fn create_one(app: &App, gh: &Github, n: NewTicket) -> Result<Ticket> {
+    let s = app.db.settings();
+    anyhow::ensure!(n.repo.contains('/'), "repository must be owner/name");
+    anyhow::ensure!(!n.title.trim().is_empty(), "title is empty");
+    let project = app.project_info(gh, false).await?;
+    let assignee = n.assignee.filter(|a| !a.is_empty());
+    if let Some(a) = &assignee {
+        anyhow::ensure!(app.lib.is_assignable(a), "unknown agent or cell '{a}'");
+    }
+    let deps: Vec<Ticket> = n.deps.iter().filter_map(|d| app.db.ticket(*d)).collect();
+    let mut body = n.body.clone();
+    let mut footer = vec![];
+    if let Some(r) = n.related.and_then(|r| app.db.ticket(r)) {
+        footer.push(format!("Related to #{}", r.number));
+    }
+    if !deps.is_empty() {
+        footer.push(format!("Depends on {}", deps.iter().map(|d| if d.repo == n.repo { format!("#{}", d.number) } else { format!("{}#{}", d.repo, d.number) }).collect::<Vec<_>>().join(", ")));
+    }
+    footer.push(format!("_Created by {} via Maestro_", n.created_by));
+    body.push_str("\n\n---\n");
+    body.push_str(&footer.join("\n"));
+    let labels: Vec<String> = assignee
+        .iter()
+        .map(|a| format!("{}:{a}", if app.lib.cell(a).is_some() { "cell" } else { "agent" }))
+        .collect();
+    let (num, url, item_id) = gh.create_issue(&project, &n.repo, &n.title, &body, &labels).await?;
+    let col = if n.start { s.col_trigger.clone() } else { String::new() };
+    if n.start {
+        let _ = gh.set_status(&project, &item_id, &col).await;
+    }
+    let (t, _) = app.db.upsert_synced(&SyncedItem {
+        item_id,
+        issue_node_id: String::new(),
+        repo: n.repo.clone(),
+        number: num,
+        title: n.title.clone(),
+        body,
+        url,
+        labels,
+        gh_status: col,
+        gh_state: "OPEN".into(),
+    })?;
+    if let Some(a) = &assignee {
+        app.db.set_field(t.id, "agent", a)?;
+    }
+    app.db.set_field(t.id, "helpers", serde_json::to_string(&valid_helpers(app, &json!(n.helpers)))?)?;
+    app.db.set_deps(t.id, &n.deps)?;
+    if n.start {
+        app.transition(t.id, State::Triage, &format!("created by {}", n.created_by));
+    } else {
+        app.emit_ticket(t.id);
+    }
+    Ok(app.db.ticket(t.id).unwrap())
+}
+
+pub async fn close_ticket(app: &App, gh: &Github, id: i64, reason: &str, comment: Option<&str>) -> Result<()> {
+    let t = app.db.ticket(id).context("not found")?;
+    cancel_runs(app, id);
+    if let Some(c) = comment.filter(|c| !c.trim().is_empty()) {
+        gh.comment(&t.repo, t.number, c).await?;
+    }
+    gh.set_issue_state(&t.repo, t.number, "closed", if reason == "not_planned" { "not_planned" } else { "completed" }).await?;
+    if app.db.ticket(id).map(|x| x.state != State::Done).unwrap_or(false) {
+        app.db.set_state(id, t.state, State::Done, "closed from Maestro")?;
+        app.emit_ticket(id);
+    }
+    let s = app.db.settings();
+    set_gh_status(app, gh, &t, &s.col_done).await;
+    git::cleanup(app, &t).await;
+    Ok(())
+}
+
 /// Orchestrator "planner": turn a free-form goal into a ticket DAG (preview only).
 pub async fn plan(app: &AppRef, goal: &str, repo: &str) -> Result<Value> {
     let orch = orchestrator(app)?;
@@ -498,7 +585,7 @@ pub async fn plan(app: &AppRef, goal: &str, repo: &str) -> Result<Value> {
     );
     let cwd = orchestrator_cwd(app, repo).await;
     let plugin = app.lib.build_plugin(&orch)?;
-    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(plan_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None }).await?;
+    let out = claude::run(app, Request { run_id: run.id, cwd: &cwd, agent: &orch, prompt, json_schema: Some(plan_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None }).await?;
     if let Some(r) = app.db.finish_run(run.id, if out.ok { "success" } else { "failed" }, out.cost, out.turns, out.session_id.as_deref(), &out.text) {
         app.emit(Event::Run { run: r });
     }
@@ -570,6 +657,7 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
              ## Instructions\n- Implement the ticket completely in this repository. Follow existing conventions.\n\
              - Build / run tests when the project has them; fix what you break.\n\
              - Commit your work with clear messages (`git add` + `git commit`). Do NOT push and do NOT open a PR — Maestro does that.\n\
+             - If you find work that is out of scope (bug, follow-up, missing feature), do not do it: create a ticket with the `maestro` tools when they are available (`create_ticket`), and mention it in your summary.\n\
              - Finish with a short markdown summary of what you changed and anything a human must check.",
             t.repo, t.number, ws.branch, base, t.title, t.body, parent_ctx, "",
             if deps_ctx.is_empty() { "(none)".into() } else { deps_ctx },
@@ -633,7 +721,7 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
             t.number, t.title, t.body, ws.base_ref, ws.base_ref
         );
         let plugin = app.lib.build_plugin(&reviewer)?;
-        let rout = claude::run(app, Request { run_id: rrun.id, cwd: &ws.path, agent: &reviewer, prompt: rprompt, json_schema: Some(review_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None }).await?;
+        let rout = claude::run(app, Request { run_id: rrun.id, cwd: &ws.path, agent: &reviewer, prompt: rprompt, json_schema: Some(review_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None }).await?;
         app.db.add_cost(id, rout.cost);
         if let Some(r) = app.db.finish_run(rrun.id, if rout.ok { "success" } else { "failed" }, rout.cost, rout.turns, rout.session_id.as_deref(), &rout.text) {
             app.emit(Event::Run { run: r });
@@ -714,7 +802,8 @@ async fn run_team(app: &App, ticket: i64, team: &Team, cwd: &std::path::Path, pr
             app.log(run.id, "system", &format!("team {} · lead {} · members {}", team.name, team.lead.meta.name, team.members.iter().map(|m| m.meta.name.as_str()).collect::<Vec<_>>().join(", ")));
         }
         let plugin = app.lib.build_team_plugin(team)?;
-        let out = claude::run(app, Request { run_id: run.id, cwd, agent: &team.lead, prompt, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents }).await?;
+        let mcp = crate::mcp::config_for(app, ticket, &team.lead)?;
+        let out = claude::run(app, Request { run_id: run.id, cwd, agent: &team.lead, prompt, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents, mcp }).await?;
         finish(app, ticket, run.id, &out);
         return Ok(out);
     }
@@ -741,7 +830,8 @@ async fn run_team(app: &App, ticket: i64, team: &Team, cwd: &std::path::Path, pr
         app.emit(Event::Run { run: run.clone() });
         app.log(run.id, "system", &format!("pipeline {} · step {}/{}", team.name, i + 1, n));
         let plugin = app.lib.build_plugin(agent)?;
-        let out = claude::run(app, Request { run_id: run.id, cwd, agent, prompt: p, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents: None }).await?;
+        let mcp = crate::mcp::config_for(app, ticket, agent)?;
+        let out = claude::run(app, Request { run_id: run.id, cwd, agent, prompt: p, json_schema: None, plugin_dir: plugin, tools: None, read_only: false, subagents: None, mcp }).await?;
         finish(app, ticket, run.id, &out);
         total.cost += out.cost;
         total.turns += out.turns;
@@ -848,6 +938,21 @@ pub async fn action(app: &AppRef, id: i64, action: &str, body: &Value) -> Result
             app.db.set_deps(id, &deps)?;
             app.emit_ticket(id);
             app.wake.notify_one();
+        }
+        "close" => {
+            let gh = app.github().await?;
+            close_ticket(app, &gh, id, body["reason"].as_str().unwrap_or("completed"), body["comment"].as_str()).await?;
+        }
+        "reopen" => {
+            let gh = app.github().await?;
+            gh.set_issue_state(&t.repo, t.number, "open", "reopened").await?;
+            app.db.set_field(id, "attempts", 0)?;
+            app.db.set_field(id, "review_rounds", 0)?;
+            app.db.set_state(id, t.state, State::Backlog, "reopened from Maestro")?;
+            if let Ok(p) = app.project_info(&gh, false).await {
+                let _ = gh.set_status(&p, &t.item_id, "").await;
+            }
+            app.emit_ticket(id);
         }
         "merge" => {
             let gh = app.github().await?;

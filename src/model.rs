@@ -199,6 +199,8 @@ pub struct Settings {
     pub auto_merge: bool,
     pub always_triage: bool,
     pub engine_enabled: bool,
+    /// Tickets created by agents through MCP are queued right away (otherwise: backlog).
+    pub mcp_auto_queue: bool,
     // --- Git
     pub base_branch: String,
     pub repo_paths: String, // "owner/repo=/abs/path" one per line

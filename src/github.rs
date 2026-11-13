@@ -221,6 +221,12 @@ impl Github {
         ))
     }
 
+    /// state: "open" | "closed"; reason: "completed" | "not_planned" | "reopened"
+    pub async fn set_issue_state(&self, repo: &str, number: i64, state: &str, reason: &str) -> Result<()> {
+        self.rest(reqwest::Method::PATCH, &format!("/repos/{repo}/issues/{number}"), Some(json!({"state": state, "state_reason": reason}))).await?;
+        Ok(())
+    }
+
     pub async fn comment(&self, repo: &str, number: i64, body: &str) -> Result<()> {
         self.rest(reqwest::Method::POST, &format!("/repos/{repo}/issues/{number}/comments"), Some(json!({"body": body}))).await?;
         Ok(())

@@ -180,6 +180,34 @@ impl Db {
         Ok(())
     }
 
+    // ---------- meta
+    pub fn meta(&self, k: &str) -> Option<String> {
+        let c = self.conn.lock();
+        c.query_row("SELECT v FROM meta WHERE k=?1", [k], |r| r.get(0)).optional().ok().flatten()
+    }
+    pub fn set_meta(&self, k: &str, v: &str) {
+        let c = self.conn.lock();
+        let _ = c.execute("INSERT INTO meta(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v", params![k, v]);
+    }
+
+    /// Persistent random token protecting the MCP endpoint.
+    pub fn mcp_token(&self) -> String {
+        if let Some(t) = self.meta("mcp_token") {
+            return t;
+        }
+        let mut buf = [0u8; 24];
+        let ok = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf)).is_ok();
+        if !ok {
+            let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = ((n >> ((i % 16) * 8)) as u8) ^ (std::process::id() as u8).wrapping_mul(i as u8 + 7);
+            }
+        }
+        let t: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        self.set_meta("mcp_token", &t);
+        t
+    }
+
     // ---------- tickets
     fn attach_deps(c: &Connection, t: &mut Ticket) {
         if let Ok(mut st) = c.prepare_cached("SELECT depends_on FROM deps WHERE ticket_id=?1") {

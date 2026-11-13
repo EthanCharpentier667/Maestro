@@ -41,6 +41,8 @@ pub struct Request<'a> {
     pub read_only: bool,
     /// JSON file defining Claude Code subagents (`--agents`), for delegate teams.
     pub subagents: Option<std::path::PathBuf>,
+    /// `--mcp-config` file (Maestro MCP server for tickets).
+    pub mcp: Option<std::path::PathBuf>,
 }
 
 pub fn base_command(s: &Settings) -> Command {
@@ -130,6 +132,10 @@ pub async fn run(app: &App, req: Request<'_>) -> Result<Outcome> {
                 }
             }
         }
+    }
+    if let Some(m) = &req.mcp {
+        cmd.arg("--mcp-config").arg(m);
+        tools.push("mcp__maestro".into());
     }
     if !tools.is_empty() {
         cmd.arg("--allowedTools").arg(tools.join(","));

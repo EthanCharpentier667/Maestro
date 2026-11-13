@@ -13,6 +13,22 @@ elif [[ "$ARGS" == *'"approve"'* ]]; then
   if [ -f /tmp/mtest/reject_once ] && [ ! -f /tmp/mtest/rejected ]; then touch /tmp/mtest/rejected; OUT='{"approve":false,"summary":"missing cooldown","issues":["add cooldown constant"]}'
   else OUT='{"approve":true,"summary":"LGTM"}'; fi
 else
+  # exercise the Maestro MCP server when asked (FAKE_MCP=1): create a follow-up ticket
+  CFG=$(printf "%s" "$ARGS" | grep -o -- "--mcp-config [^ ]*" | cut -d" " -f2)
+  if [ -n "$FAKE_MCP" ] && [ -n "$CFG" ] && [[ "$PROMPT" == *"Jump pad"* ]]; then
+    python3 - "$CFG" <<'PY'
+import json, sys, urllib.request
+c = json.load(open(sys.argv[1]))["mcpServers"]["maestro"]
+def rpc(m, p=None, i=1):
+    r = urllib.request.Request(c["url"], json.dumps({"jsonrpc": "2.0", "id": i, "method": m, "params": p or {}}).encode(), {**c["headers"], "content-type": "application/json"})
+    return json.load(urllib.request.urlopen(r))
+rpc("initialize", {"protocolVersion": "2025-06-18"})
+names = [t["name"] for t in rpc("tools/list")["result"]["tools"]]
+res = rpc("tools/call", {"name": "create_ticket", "arguments": {"title": "Jump pad SFX", "body": "Add a sound when bouncing.", "assignee": "gamedev", "depends_on": [3]}})
+own = rpc("tools/call", {"name": "close_ticket", "arguments": {"number": 3, "comment": "x"}})
+open("/tmp/mtest/mcp.txt", "w").write(json.dumps({"tools": names, "create": res["result"]["content"][0]["text"][:300], "close_own_error": own["result"]["isError"]}))
+PY
+  fi
   F="work_$(date +%s%N).txt"; echo "done by agent" > "$F"; git add "$F" >/dev/null 2>&1; git commit -qm "feat: work" >/dev/null 2>&1
   emit '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"'"$F"'"}}]}}'
   OUT=null; RESULT="Implemented the ticket, wrote $F"

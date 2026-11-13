@@ -21,6 +21,8 @@ pub struct AgentMeta {
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     pub effort: String,
+    /// Give this agent the Maestro MCP tools (tickets). Default: true for workers.
+    pub maestro_tools: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

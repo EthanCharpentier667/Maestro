@@ -66,7 +66,7 @@ async function load() {
   const d = await api('/api/state');
   S.tickets = new Map(d.tickets.map(t => [t.id, t]));
   S.agents = d.agents; S.cells = d.cells || []; S.skills = d.skills; S.settings = d.settings; S.project = d.project; S.stats = d.stats;
-  S.envSecrets = d.env_secrets || []; S.sm = d.statemachine; S.runs = d.runs; S.busy = d.busy; S.lastSync = d.last_sync; S.claudeVersion = d.claude_version;
+  S.envSecrets = d.env_secrets || []; S.mcp = d.mcp; S.sm = d.statemachine; S.runs = d.runs; S.busy = d.busy; S.lastSync = d.last_sync; S.claudeVersion = d.claude_version;
   renderChrome(); render();
 }
 
@@ -166,7 +166,7 @@ function viewBoard() {
     cols = [...names, ''].map(n => [n || 'No status', ts.filter(t => (t.gh_status || '') === n), null]);
   } else cols = BOARD_COLS.map(([n, st]) => [n, ts.filter(t => st.includes(t.state)), st[0]]);
   return h('div', {},
-    filterBar([h('div', { class: 'seg' },
+    filterBar([h('button', { class: 'btn primary', onclick: () => newTicket() }, '+ New ticket'), h('div', { class: 'seg' },
       h('button', { class: S.boardMode === 'state' ? 'on' : '', onclick: () => { S.boardMode = 'state'; render(); } }, 'Maestro states'),
       h('button', { class: S.boardMode === 'github' ? 'on' : '', onclick: () => { S.boardMode = 'github'; render(); } }, 'GitHub columns'))]),
     h('div', { class: 'board' }, cols.map(([name, list, st]) => h('div', { class: 'col' },
@@ -202,7 +202,13 @@ async function openTicket(id, refresh = false) {
   if (['running', 'reviewing', 'triage'].includes(t.state)) actions.push(A('■ Cancel run', 'pause', null, 'danger'));
   else if (!['done', 'paused'].includes(t.state)) actions.push(A('❚❚ Pause', 'pause'));
   if (t.pr_number && t.state !== 'done') actions.push(A('⇲ Merge PR', 'merge', null, 'primary'));
-  if (t.state !== 'backlog') actions.push(A('Reset', 'reset', null, 'danger'));
+  if (t.state !== 'backlog' && t.state !== 'done') actions.push(A('Reset', 'reset', null, 'danger'));
+  if (t.gh_state === 'CLOSED' || t.state === 'done') actions.push(A('Reopen', 'reopen'));
+  else actions.push(h('button', { class: 'btn sm danger', onclick: () => {
+    const c = prompt('Close this issue. Optional comment:', ''); if (c === null) return;
+    const notPlanned = confirm('Close as "not planned"? (Cancel = completed)');
+    act(() => api(`/api/tickets/${id}/close`, { method: 'POST', body: { comment: c, reason: notPlanned ? 'not_planned' : 'completed' } }), 'Issue closed');
+  } }, 'Close issue'));
 
   const drawerRun = refresh && S.drawerRun ? S.drawerRun : (d.runs[0]?.id || null);
   S.drawerRun = drawerRun;
@@ -234,6 +240,28 @@ async function openTicket(id, refresh = false) {
       drawerRun ? logBox : h('div', { class: 'muted small' }, 'no runs yet')));
   $('#drawer').classList.remove('hidden');
   if (drawerRun) loadLog(drawerRun, logBox);
+}
+
+function newTicket() {
+  const repos = [...new Set([...S.tickets.values()].map(t => t.repo))].sort();
+  const f = { repo: S.planRepo || repos[0] || '', title: '', body: '', agent: '', helpers: [], deps: [], start: false };
+  const others = [...S.tickets.values()].filter(t => t.state !== 'done').sort((a, b) => a.number - b.number);
+  S.drawerTicket = null;
+  put($('#drawer-inner'),
+    h('div', { class: 'h' }, h('h2', {}, 'New ticket'), h('button', { class: 'btn sm ghost', onclick: closeDrawer }, '✕')),
+    h('p', { class: 'muted small' }, 'Creates a GitHub issue and adds it to the project.'),
+    h('label', { class: 'f' }, h('span', {}, 'Repository'), h('input', { list: 'nt-repos', value: f.repo, placeholder: 'owner/repo', oninput: e => f.repo = e.target.value }), h('datalist', { id: 'nt-repos' }, repos.map(r => h('option', { value: r })))),
+    h('label', { class: 'f' }, h('span', {}, 'Title'), h('input', { oninput: e => f.title = e.target.value })),
+    h('label', { class: 'f' }, h('span', {}, 'Description (markdown, acceptance criteria)'), h('textarea', { rows: 9, style: 'font-family:inherit', oninput: e => f.body = e.target.value })),
+    h('div', { class: 'grid2' },
+      h('div', {},
+        h('label', { class: 'f' }, h('span', {}, 'Assigned to'), h('select', { onchange: e => f.agent = e.target.value }, assigneeOptions('', '- orchestrator decides -'))),
+        h('label', { class: 'f' }, h('span', {}, 'Helpers'), h('select', { multiple: true, size: 3, onchange: e => f.helpers = [...e.target.selectedOptions].map(o => o.value) }, workersList().map(a => h('option', { value: a.name }, a.name))))),
+      h('label', { class: 'f' }, h('span', {}, 'Depends on'), h('select', { multiple: true, size: 7, onchange: e => f.deps = [...e.target.selectedOptions].map(o => +o.value) }, others.map(o => h('option', { value: o.id }, `#${o.number} ${o.title.slice(0, 50)}`))))),
+    h('label', { class: 'chk' }, h('input', { type: 'checkbox', onchange: e => f.start = e.target.checked }), 'Queue now (put it in the trigger column)'),
+    h('div', { class: 'actions' }, h('button', { class: 'btn primary', onclick: () => act(async () => { const t = await api('/api/tickets', { method: 'POST', body: f }); S.tickets.set(t.id, t); openTicket(t.id); render(); }, 'Issue created') }, 'Create issue'),
+      h('button', { class: 'btn ghost', onclick: closeDrawer }, 'Cancel')));
+  $('#drawer').classList.remove('hidden');
 }
 
 // ───────── LOGS
@@ -566,6 +594,11 @@ function viewSettings() {
       h('label', { class: 'f' }, h('span', {}, 'Local repository paths (optional)'),
         h('textarea', { rows: 3, oninput: e => s.repo_paths = e.target.value, placeholder: 'owner/repo=/Users/you/dev/repo' }, s.repo_paths || ''),
         h('small', {}, 'One per line. Otherwise Maestro clones into its data dir. Each ticket always gets its own git worktree + branch.'))),
+    h('div', { class: 'card', style: 'margin-top:14px' }, h('h3', { style: 'margin-top:0' }, '5 · MCP (ticket tools)'),
+      h('p', { class: 'small muted' }, 'Worker agents get these tools automatically: list_tickets, get_ticket, list_agents, create_ticket, comment_ticket, close_ticket. Opt out per agent with ', h('code', {}, 'maestro_tools: false'), '.'),
+      chk('mcp_auto_queue', 'Tickets created by agents are queued right away (otherwise they land in the backlog for you to start)'),
+      h('p', { class: 'small', style: 'margin:10px 0 6px' }, 'Use the same tools from your own Claude Code:'),
+      h('pre', { class: 'body-md mono small', style: 'max-height:none' }, S.mcp ? `claude mcp add --transport http maestro ${S.mcp.url} \\\n  --header "Authorization: Bearer ${S.mcp.token}"` : '')),
     out,
     h('div', { style: 'margin:14px 0 30px' }, h('button', { class: 'btn primary', onclick: save }, 'Save settings')));
 }

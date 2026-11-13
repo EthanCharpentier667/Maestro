@@ -146,6 +146,35 @@ Instructions for the lead (delegate) or for every step (pipeline).
 
 Default cells: `gameplay-squad` (delegate) and `feature-pipeline` (gamedesign then gamedev).
 
+### Tickets and the MCP server
+
+Maestro talks to GitHub directly (GraphQL for the project, REST for issues and pull requests). From the UI you can
+create a ticket ("New ticket" on the board), and close or reopen an issue from the ticket panel. When all
+sub-tickets of a split ticket are done, its issue is closed.
+
+Maestro also serves an MCP server at `/mcp` (Streamable HTTP, protected by a token generated on first start).
+Worker agents get it automatically through `--mcp-config`, so they can manage tickets themselves:
+
+| Tool | Purpose |
+|---|---|
+| `list_tickets` | Tickets with state, assignee, dependencies (filter by state or title). |
+| `get_ticket` | One ticket with its body. |
+| `list_agents` | Agents and cells a ticket can be assigned to. |
+| `create_ticket` | New issue on the board (follow-ups, bugs found, out-of-scope work), with assignee and dependencies. |
+| `comment_ticket` | Comment on an issue. |
+| `close_ticket` | Close an issue (duplicate, not needed). An agent cannot close the ticket it is working on. |
+
+Tickets created by an agent link back to the ticket it was working on and land in the backlog, unless
+"queue right away" is enabled in Settings. An agent can create at most 10 tickets per ticket it works on.
+Disable the tools for an agent with `maestro_tools: false` in its front-matter.
+
+The same server works from your own Claude Code (the exact command, with the token, is shown in Settings):
+
+```bash
+claude mcp add --transport http maestro http://127.0.0.1:7878/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
 ### Planner
 
 Describe a goal in the Planner page. The orchestrator reads the repository and proposes a set of tickets with
@@ -162,6 +191,7 @@ queued right away.
 - Agents run code on your machine. The default is `acceptEdits` with a per-agent tool allow-list.
   Only use `bypassPermissions` on a dedicated machine or VM.
 - The orchestrator and the reviewer run read-only (`Edit` and `Write` are disallowed).
+- The MCP endpoint requires its token (`Authorization: Bearer`). The token is stored in the database and shown in Settings.
 
 ## Project layout
 
@@ -175,6 +205,7 @@ src/
   git.rs       clones, worktrees, push
   engine.rs    sync, scheduler, triage, worker, review, planner
   api.rs       HTTP API, SSE, embedded UI
+  mcp.rs       MCP server (ticket tools)
 web/           index.html, app.js, style.css (plain JS, no build step)
 agents/        default agents (copied to maestro-data on first start)
 cells/         default cells

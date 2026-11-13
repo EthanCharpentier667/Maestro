@@ -44,6 +44,12 @@ class H(BaseHTTPRequestHandler):
         if m: v = pulls[int(m[1])]; return self.send({"merged": v["merged"], "state": v["state"]})
         self.send({"message": "nf"}, 404)
 
+    def do_PATCH(self):
+        m = re.match(rf"/repos/{REPO}/issues/(\d+)$", self.path); b = self.body()
+        if m and "state" in b:
+            issues[int(m[1])]["state"] = "CLOSED" if b["state"] == "closed" else "OPEN"; return self.send({})
+        self.send({}, 404)
+
     def do_PUT(self):
         m = re.match(rf"/repos/{REPO}/pulls/(\d+)/merge", self.path)
         if m:

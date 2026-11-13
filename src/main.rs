@@ -11,6 +11,7 @@ mod claude;
 mod db;
 mod engine;
 mod git;
+mod mcp;
 mod github;
 mod model;
 
@@ -51,6 +52,8 @@ async fn main() -> anyhow::Result<()> {
         wake: Notify::new(),
         last_sync: Mutex::new(None),
         repo_locks: Mutex::new(HashMap::new()),
+        base_url: format!("http://{}", addr.replace("0.0.0.0", "127.0.0.1").replace("[::]", "[::1]")),
+        mcp_created: Mutex::new(HashMap::new()),
     });
 
     tokio::spawn(engine::sync_loop(app.clone()));
