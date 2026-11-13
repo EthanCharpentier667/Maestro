@@ -82,18 +82,35 @@ const DEFAULT_AGENTS: &[(&str, &str)] = &[
     ("gamedev", include_str!("../agents/gamedev.md")),
     ("gamedesign", include_str!("../agents/gamedesign.md")),
     ("devops", include_str!("../agents/devops.md")),
+    ("docs", include_str!("../agents/docs.md")),
     ("reviewer", include_str!("../agents/reviewer.md")),
 ];
 const DEFAULT_CELLS: &[(&str, &str)] = &[
     ("gameplay-squad", include_str!("../cells/gameplay-squad.md")),
     ("feature-pipeline", include_str!("../cells/feature-pipeline.md")),
+    ("engine-feature", include_str!("../cells/engine-feature.md")),
 ];
 const DEFAULT_SKILLS: &[(&str, &str)] = &[
     ("commit-conventions", include_str!("../skills/commit-conventions/SKILL.md")),
-    ("game-design-doc", include_str!("../skills/game-design-doc/SKILL.md")),
-    ("cpp-engine", include_str!("../skills/cpp-engine/SKILL.md")),
-    ("unity-gameplay", include_str!("../skills/unity-gameplay/SKILL.md")),
     ("code-review", include_str!("../skills/code-review/SKILL.md")),
+    ("cpp-engine", include_str!("../skills/cpp-engine/SKILL.md")),
+    ("game-design-doc", include_str!("../skills/game-design-doc/SKILL.md")),
+    ("game-balancing", include_str!("../skills/game-balancing/SKILL.md")),
+    ("luau-gameplay", include_str!("../skills/luau-gameplay/SKILL.md")),
+    ("luau-modules", include_str!("../skills/luau-modules/SKILL.md")),
+    ("server-authority", include_str!("../skills/server-authority/SKILL.md")),
+    ("engine-repo-sync", include_str!("../skills/engine-repo-sync/SKILL.md")),
+    ("engine-update-watch", include_str!("../skills/engine-update-watch/SKILL.md")),
+    ("notify-game-on-engine-update", include_str!("../skills/notify-game-on-engine-update/SKILL.md")),
+    ("plan-vs-implemented", include_str!("../skills/plan-vs-implemented/SKILL.md")),
+    ("plan-tickets", include_str!("../skills/plan-tickets/SKILL.md")),
+    ("raise-engine-gap", include_str!("../skills/raise-engine-gap/SKILL.md")),
+    ("add-plugin", include_str!("../skills/add-plugin/SKILL.md")),
+    ("add-component", include_str!("../skills/add-component/SKILL.md")),
+    ("add-engine-call", include_str!("../skills/add-engine-call/SKILL.md")),
+    ("write-manual", include_str!("../skills/write-manual/SKILL.md")),
+    ("verify", include_str!("../skills/verify/SKILL.md")),
+    ("xmake-build", include_str!("../skills/xmake-build/SKILL.md")),
 ];
 
 pub struct Library {
