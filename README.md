@@ -4,7 +4,7 @@ Maestro turns a GitHub Project (V2) board into a team of AI agents.
 
 Move a card into the trigger column and an orchestrator agent triages it: it either assigns the ticket to a
 specialist (engine, gameplay, game design, devops...) or to a cell (a group of agents), splits it into
-sub-tickets with dependencies, or asks a clarifying question. Each specialist works in its own git worktree using Claude Code on your machine, Maestro
+sub-tickets with dependencies, or asks a clarifying question. Each specialist works in its own clone of the repository (in a hidden `.maestro_workspaces/` folder) using Claude Code on your machine, Maestro
 pushes the branch and opens a pull request, a reviewer agent checks it (and sends it back for fixes if needed),
 and the board columns are kept in sync along the way.
 
@@ -41,7 +41,8 @@ override the Settings page and are never written to the database.
 | `MAESTRO_CLAUDE_OAUTH_TOKEN` | | Token from `claude setup-token` (also reads `CLAUDE_CODE_OAUTH_TOKEN`). |
 | `MAESTRO_ANTHROPIC_API_KEY` | | Anthropic API key (also reads `ANTHROPIC_API_KEY`). |
 | `MAESTRO_ADDR` | `127.0.0.1:7878` | Listen address. Keep it on localhost, the UI has no authentication. |
-| `MAESTRO_DATA` | `./maestro-data` | Database, agents, skills, clones, worktrees. |
+| `MAESTRO_DATA` | `./maestro-data` | Database, agents, skills, mirrors, workspaces. |
+| `MAESTRO_WORKSPACES` | `$MAESTRO_DATA/.maestro_workspaces` | One clone per ticket (agent workspaces). |
 | `MAESTRO_GITHUB_API` | `https://api.github.com` | For GitHub Enterprise, e.g. `https://ghe.example.com/api/v3`. |
 | `MAESTRO_GIT_BASE` | `https://github.com` | Git host (GitHub Enterprise). |
 | `RUST_LOG` | `maestro=info` | Log level. |
@@ -59,12 +60,17 @@ Everything is configured from the Settings page.
    "gh CLI" mode. Set the project owner and number (`github.com/users/<owner>/projects/<number>`), the status
    field name (`Status` by default) and the column names. "Test GitHub" lists the columns it found and any that are missing.
 3. **Execution**: number of parallel agents, attempts per ticket, review rounds, auto-merge, always-triage.
-4. **Git**: base branch, and optional local paths (`owner/repo=/path/to/repo`, one per line). Without a path,
-   Maestro clones the repository into its data directory.
+4. **Repository** (Settings → Project): the GitHub repository coupled to the project. Pick it in the list (the
+   repositories already linked to the project come first) and click "Link": Maestro also links it to the project on
+   GitHub. New tickets, the planner and agent-created tickets target it by default. The engine does not start
+   without one; when the project has exactly one linked repository it is picked automatically.
+5. **Git**: base branch, and optional local paths (`owner/repo=/path/to/repo`, one per line). A local path is only
+   used as a source to clone from (it is never checked out or modified). Without one, Maestro keeps a bare mirror
+   in its data directory.
 
 **Several projects**: the switcher at the top of the sidebar (like GitHub Desktop) lists your saved projects.
 "Add project…" fetches the GitHub projects your token can see (yours and your organizations'). Each project keeps its
-own board, columns, base branch and repo paths (Settings → Project). Only one project is active at a time: switching
+own board, columns, repository, base branch and repo paths (Settings → Project). Only one project is active at a time: switching
 pauses the engine, and is refused while agents are running.
 
 Then click "Start engine".
@@ -72,7 +78,7 @@ Then click "Start engine".
 ## How it works
 
 ```
-GitHub Project --(polling sync)--> local tickets --> state machine --> Claude Code (one worktree/branch per ticket)
+GitHub Project --(polling sync)--> local tickets --> state machine --> Claude Code (one clone/branch per ticket)
       ^                                                                       |
       +------------- column status, comments, pull requests, merges <--------+
 ```
@@ -90,13 +96,32 @@ ready -> running -> reviewing <-> running -> awaiting_merge -> done
 - **blocked**: waiting for dependencies to reach `done`. Dependencies are parsed from issue bodies
   (`Depends on #12`, `Blocked by #3`, `Requires owner/repo#5`) and can be edited in the UI.
 - **split**: becomes `done` once all of its sub-tickets are done.
-- **running**: the agent works on `maestro/<number>-<title>` in an isolated worktree and commits.
+- **running**: the agent works on `maestro/<number>-<title>` in its own clone and commits.
   Maestro pushes the branch and opens a PR that closes the issue.
-- **reviewing**: the reviewer (read-only) approves or sends feedback; the worker fixes it on the same branch.
+- **reviewing**: Maestro fetches the latest base and checks that the branch still merges cleanly. The reviewer
+  (read-only) is told about any conflict; a conflicting branch is never approved. Feedback (and conflicts) go back to
+  the worker, which fixes them on the same branch (`git merge refs/maestro/base/<base>`, resolve, commit).
 - **awaiting_merge**: merge on GitHub, with the "Merge PR" button, or enable auto-merge. A merged PR or closed issue moves the ticket to `done`.
+  If GitHub reports that the PR now conflicts with the base (another PR landed), the ticket goes back to the agent.
+  Conflict fixes count as review rounds.
 - **needs_human**: the agent failed, produced no changes, or the orchestrator needs an answer. Use "Retriage" or "Retry agent".
 
 The state machine page is generated from the same transition table the engine enforces (`src/model.rs`).
+
+### Workspaces
+
+Agents never share a working tree. Every ticket gets a full, independent clone:
+
+```
+maestro-data/
+  mirrors/<owner>__<repo>.git          bare mirror (only without a local path)
+  .maestro_workspaces/<owner>__<repo>/
+    _base/                             read-only snapshot of the base branch (orchestrator, planner)
+    <issue number>/                    the ticket's clone, on its maestro/... branch
+```
+
+Clones are made locally (objects are hard-linked, so it is fast) and fetch/push straight to GitHub. Your own
+checkout, its branches and its index are never touched. A ticket's clone is deleted when it is done.
 
 ### Agents and skills
 
@@ -207,7 +232,7 @@ src/
   db.rs        SQLite: tickets, dependencies, transitions, runs, logs
   github.rs    Projects V2 GraphQL and REST (issues, comments, pull requests)
   claude.rs    runs `claude -p --output-format stream-json`, parses events, cancellation
-  git.rs       clones, worktrees, push
+  git.rs       per-ticket clones (.maestro_workspaces), conflict check, push
   engine.rs    sync, scheduler, triage, worker, review, planner
   api.rs       HTTP API, SSE, embedded UI
   mcp.rs       MCP server (ticket tools)
@@ -234,7 +259,8 @@ mkdir -p /tmp/mtest/remotes/me && git init --bare -b main /tmp/mtest/remotes/me/
 MAESTRO_GITHUB_API=http://127.0.0.1:8787 MAESTRO_GIT_BASE=file:///tmp/mtest/remotes cargo run --release
 ```
 
-In Settings, set the Claude binary to `tests/fake_claude.sh`, any token, owner `me`, project `1`.
+In Settings, set the Claude binary to `tests/fake_claude.sh`, any token, owner `me`, project `1`, and link the
+repository `me/game`. Run Maestro with `FAKE_CONFLICT=1` to exercise the merge-conflict loop on "Main menu".
 
 ## License
 

@@ -10,6 +10,7 @@ issues = {}   # number -> dict
 items = {}    # item id -> {"issue": n, "status": name}
 pulls = {}
 comments = []
+linked = []   # repositories linked to the project
 n_issue = [0]; n_pr = [100]
 
 def add_issue(title, body, status="Backlog", labels=()):
@@ -33,7 +34,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = self.path.split("?")[0]
-        if p == "/state": return self.send({"issues": issues, "items": items, "pulls": pulls, "comments": comments})
+        if p == "/state": return self.send({"issues": issues, "items": items, "pulls": pulls, "comments": comments, "linked": linked})
         if p == f"/repos/{REPO}": return self.send({"default_branch": "main"})
         m = re.match(rf"/repos/{REPO}/issues/(\d+)/comments", p)
         if m: return self.send([{"user": {"login": c["by"]}, "body": c["body"]} for c in comments if c["n"] == int(m[1])])
@@ -41,7 +42,7 @@ class H(BaseHTTPRequestHandler):
             head = self.path.split("head=")[-1].split(":")[-1] if "head=" in self.path else None
             return self.send([{"number": k, "html_url": f"http://x/pull/{k}"} for k, v in pulls.items() if v["head"] == head and v["state"] == "open"])
         m = re.match(rf"/repos/{REPO}/pulls/(\d+)$", p)
-        if m: v = pulls[int(m[1])]; return self.send({"merged": v["merged"], "state": v["state"]})
+        if m: v = pulls[int(m[1])]; return self.send({"merged": v["merged"], "state": v["state"], "mergeable": v.get("mergeable")})
         self.send({"message": "nf"}, 404)
 
     def do_PATCH(self):
@@ -78,6 +79,7 @@ class H(BaseHTTPRequestHandler):
             kind = "organization" if "organization(" in q else "user"
             if kind == "organization": return self.send({"data": {"organization": None}, "errors": [{"message": "no org"}]})
             return self.send({"data": {"user": {"projectV2": {"id": "PVT_1", "title": "Game board", "url": "http://x/p/1",
+                "repositories": {"nodes": [{"nameWithOwner": r} for r in linked]},
                 "fields": {"nodes": [{}, {"id": "F_status", "name": "Status", "options": [{"id": i, "name": n} for i, n in OPTS]}]}}}}})
         if "items(first" in q:
             nodes = []
@@ -90,6 +92,13 @@ class H(BaseHTTPRequestHandler):
             return self.send({"data": {"node": {"items": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}})
         if "updateProjectV2ItemFieldValue" in q:
             items[v["i"]]["status"] = dict(OPTS)[v["o"]]; return self.send({"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": v["i"]}}}})
+        if "repository(owner" in q:
+            r = f"{v['o']}/{v['n']}"
+            return self.send({"data": {"repository": {"id": f"R_{r}"} if r == REPO else None}})
+        if "linkProjectV2ToRepository" in q:
+            r = v["r"][2:]
+            if r not in linked: linked.append(r)
+            return self.send({"data": {"linkProjectV2ToRepository": {"repository": {"id": v["r"]}}}})
         if "addProjectV2ItemById" in q:
             n = int(v["c"].split("_")[1]); return self.send({"data": {"addProjectV2ItemById": {"item": {"id": f"PVTI_{n}"}}}})
         self.send({"errors": [{"message": "unknown query"}]})

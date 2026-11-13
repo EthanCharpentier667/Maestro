@@ -34,7 +34,7 @@ pub struct Agent {
 
 /// A cell is a reusable group of agents working on the same ticket.
 ///  - mode `delegate`: the lead runs with the members declared as Claude Code
-///    subagents and delegates to them (one session, one worktree).
+///    subagents and delegates to them (one session, one workspace).
 ///  - mode `pipeline`: lead then members run one after another on the same
 ///    branch, each one receiving the previous summaries.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

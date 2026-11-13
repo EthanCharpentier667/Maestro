@@ -22,7 +22,7 @@ pub struct App {
     pub project: Mutex<Option<ProjectInfo>>,
     pub wake: Notify,
     pub last_sync: Mutex<Option<(String, Option<String>)>>,
-    /// One async lock per repository: serialises clone / fetch / worktree ops.
+    /// One async lock per repository: serialises mirror / clone ops.
     pub repo_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// http://host:port used by agents to reach the MCP endpoint.
     pub base_url: String,

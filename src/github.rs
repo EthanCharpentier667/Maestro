@@ -26,6 +26,8 @@ pub struct ProjectInfo {
     pub status_field_id: String,
     /// (option id, option name)
     pub options: Vec<(String, String)>,
+    /// Repositories linked to the project on GitHub (owner/name).
+    pub repos: Vec<String>,
 }
 
 impl ProjectInfo {
@@ -136,7 +138,7 @@ impl Github {
     }
 
     pub async fn project(&self, owner: &str, number: i64, status_field: &str) -> Result<ProjectInfo> {
-        const FIELDS: &str = "id title url fields(first:50){nodes{... on ProjectV2SingleSelectField{id name options{id name}}}}";
+        const FIELDS: &str = "id title url repositories(first:50){nodes{nameWithOwner}} fields(first:50){nodes{... on ProjectV2SingleSelectField{id name options{id name}}}}";
         let mut proj = Value::Null;
         for kind in ["organization", "user"] {
             let q = format!("query($l:String!,$n:Int!){{ {kind}(login:$l){{ projectV2(number:$n){{ {FIELDS} }} }} }}");
@@ -159,6 +161,10 @@ impl Github {
             title: proj["title"].as_str().unwrap_or_default().into(),
             url: proj["url"].as_str().unwrap_or_default().into(),
             status_field_id: field["id"].as_str().unwrap_or_default().into(),
+            repos: proj["repositories"]["nodes"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|r| r["nameWithOwner"].as_str().map(String::from)).collect())
+                .unwrap_or_default(),
             options: field["options"]
                 .as_array()
                 .map(|a| {
@@ -168,6 +174,16 @@ impl Github {
                 })
                 .unwrap_or_default(),
         })
+    }
+
+    /// Link a repository to a project (no-op if already linked).
+    pub async fn link_repo(&self, project_id: &str, repo: &str) -> Result<()> {
+        let (owner, name) = repo.split_once('/').ok_or_else(|| anyhow!("repository must be owner/name"))?;
+        let d = self.graphql("query($o:String!,$n:String!){ repository(owner:$o,name:$n){ id } }", json!({"o": owner, "n": name})).await?;
+        let rid = d["repository"]["id"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("repository {repo} not found (or no access)"))?;
+        const M: &str = "mutation($p:ID!,$r:ID!){ linkProjectV2ToRepository(input:{projectId:$p,repositoryId:$r}){ repository{ id } } }";
+        self.graphql(M, json!({"p": project_id, "r": rid})).await?;
+        Ok(())
     }
 
     pub async fn items(&self, project_id: &str, status_field: &str) -> Result<Vec<SyncedItem>> {
@@ -287,14 +303,15 @@ impl Github {
         Ok((pr["number"].as_i64().unwrap_or(0), pr["html_url"].as_str().unwrap_or_default().into()))
     }
 
-    /// "open" | "merged" | "closed"
-    pub async fn pr_state(&self, repo: &str, number: i64) -> Result<String> {
+    /// ("open" | "merged" | "closed", mergeable). `mergeable` is None while GitHub computes it.
+    pub async fn pr_state(&self, repo: &str, number: i64) -> Result<(String, Option<bool>)> {
         let v = self.rest(reqwest::Method::GET, &format!("/repos/{repo}/pulls/{number}"), None).await?;
-        Ok(if v["merged"].as_bool().unwrap_or(false) {
+        let state = if v["merged"].as_bool().unwrap_or(false) {
             "merged".into()
         } else {
             v["state"].as_str().unwrap_or("open").into()
-        })
+        };
+        Ok((state, v["mergeable"].as_bool()))
     }
 
     pub async fn merge_pr(&self, repo: &str, number: i64) -> Result<()> {

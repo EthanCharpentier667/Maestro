@@ -97,7 +97,8 @@ function renderChrome() {
   renderProjectSwitcher();
   const ts = [...S.tickets.values()];
   const count = s => ts.filter(t => t.state === s).length;
-  $('#proj').innerHTML = S.project ? `${esc(S.project.title)} <small><a href="${esc(S.project.url)}" target="_blank">GitHub ↗</a></small>` : '<span class="muted">No project — open Settings</span>';
+  const repo = S.settings.repository ? ` <small class="mono">${esc(S.settings.repository)}</small>` : ' <small class="muted">no repository linked</small>';
+  $('#proj').innerHTML = S.project ? `${esc(S.project.title)}${repo} <small><a href="${esc(S.project.url)}" target="_blank">GitHub ↗</a></small>` : '<span class="muted">No project — open Settings</span>';
   put($('#kpis'),
     h('span', { class: 'kpi' }, h('b', {}, ts.length), ' tickets'),
     h('span', { class: 'kpi' }, h('span', { class: 'dot', style: `background:${sc('running')}` }), ' ', h('b', {}, count('running') + count('reviewing')), ' active'),
@@ -534,11 +535,34 @@ function agentEditor() {
       ] : [h('h3', {}, 'Skill'), h('p', {}, 'Standard Claude Code SKILL.md: front-matter ', h('code', {}, 'name'), ' + ', h('code', {}, 'description'), ' (tells Claude when to load it), then instructions. Attach it to agents via their ', h('code', {}, 'skills'), ' list.')])));
 }
 
+// Pick the project's repository and link it to the GitHub project.
+function repoLinker(s) {
+  const linked = S.project?.repos || [];
+  const isLinked = r => linked.some(x => x.toLowerCase() === (r || '').toLowerCase());
+  const st = h('small', {});
+  const paint = () => {
+    const r = (s.repository || '').trim();
+    st.textContent = !r ? '⚠ No repository: the engine cannot start until one is linked.' : isLinked(r) ? '✓ Linked to the project on GitHub.' : 'Not linked to the project yet: click "Link".';
+  };
+  const choices = [...linked, ...repoChoices().filter(r => !isLinked(r))];
+  const input = h('input', { list: 'proj-repos', value: s.repository || '', placeholder: 'owner/repo', oninput: e => { s.repository = e.target.value; paint(); } });
+  paint();
+  return h('label', { class: 'f' }, h('span', {}, 'GitHub repository'),
+    h('div', { style: 'display:flex;gap:8px' }, input,
+      h('button', { class: 'btn sm', type: 'button', onclick: ev => { ev.preventDefault(); act(async () => {
+        const r = await api('/api/projects/repository', { method: 'POST', body: { repo: s.repository } });
+        s.repository = r.repository; S.settings.repository = r.repository; if (r.project) S.project = r.project; paint(); renderChrome();
+      }, 'Repository linked'); } }, 'Link')),
+    h('datalist', { id: 'proj-repos' }, choices.map(r => h('option', { value: r }))), st);
+}
+
 // repos of the current board first, then the ones GitHub says we can push to (fetched once, best effort)
 function repoChoices() {
   if (S.repoList === undefined || S.repoList === null) { S.repoList = []; api('/api/github/repos').then(r => { S.repoList = r; }).catch(() => {}); }
-  const own = [...new Set([...S.tickets.values()].map(t => t.repo))].sort();
-  return [...own, ...S.repoList.filter(r => !own.includes(r))];
+  const main = S.settings?.repository ? [S.settings.repository] : [];
+  const own = [...new Set([...(S.project?.repos || []), ...[...S.tickets.values()].map(t => t.repo)])].filter(r => !main.includes(r)).sort();
+  const first = [...main, ...own];
+  return [...first, ...S.repoList.filter(r => !first.includes(r))];
 }
 
 // ───────── PROJECTS (switcher, like GitHub Desktop)
@@ -577,7 +601,7 @@ function goSettings(tab) {
 async function switchProject(key) {
   const r = await act(() => api('/api/projects/switch', { method: 'POST', body: { key } }));
   if (!r) return;
-  S.draft = null; S.filter.repo = ''; S.repoList = null;
+  S.draft = null; S.filter.repo = ''; S.repoList = null; S.planRepo = null;
   await load();
   toast(`Switched to ${activeProject()?.name || key} — engine paused`, 'ok');
 }
@@ -614,7 +638,7 @@ async function openProjectPicker() {
   const ov = h('div', { class: 'overlay', onclick: close },
     h('div', { class: 'modal', onclick: e => e.stopPropagation() },
       h('div', { class: 'h' }, h('h3', { style: 'margin:0' }, 'Add a GitHub project'), h('button', { class: 'btn ghost sm', onclick: close }, '✕')),
-      h('p', { class: 'small muted', style: 'margin:-6px 0 12px' }, 'Switching pauses the engine. Each project keeps its own board, columns and repo paths.'),
+      h('p', { class: 'small muted', style: 'margin:-6px 0 12px' }, 'Switching pauses the engine. Each project keeps its own board, columns and repository (the first repository linked to the project on GitHub is picked by default).'),
       body));
   document.body.append(ov); draw();
   try { st.list = await api('/api/github/projects'); } catch (e) { st.list = []; st.err = e.message; }
@@ -662,11 +686,12 @@ function viewSettings() {
         h('div', { class: 'grid3' },
           inp('col_trigger', '▶ Trigger column', 'Cards moved here get picked up'),
           inp('col_in_progress', 'In progress', ''), inp('col_review', 'In review', ''), inp('col_done', 'Done', ''))),
-      section('Repository', 'Where agents work for this project.',
+      section('Repository', 'The GitHub repository coupled to this project: new tickets and the planner target it, and it is linked to the project on GitHub.',
+        repoLinker(s),
         inp('base_branch', 'Base branch', 'Empty = repository default branch'),
         h('label', { class: 'f' }, h('span', {}, 'Local repository paths (optional)'),
           h('textarea', { rows: 3, oninput: e => s.repo_paths = e.target.value, placeholder: 'owner/repo=/Users/you/dev/repo' }, s.repo_paths || ''),
-          h('small', {}, 'One per line. Otherwise Maestro clones into its data dir. Each ticket always gets its own git worktree + branch.'))),
+          h('small', {}, 'One per line. Used only as a source to clone from (never modified). Every ticket gets its own clone in .maestro_workspaces/ so agents never step on each other; merge conflicts are checked before review and sent back to the agent.'))),
       cur && S.projects.length > 1 ? section('Danger zone', '', h('button', { class: 'btn danger sm', onclick: () => {
         const other = S.projects.find(p => p.key !== cur.key);
         if (confirm(`Switch to "${other.name}"?`)) switchProject(other.key);

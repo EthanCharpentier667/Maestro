@@ -57,6 +57,7 @@ pub fn router(app: AppRef) -> Router {
         .route("/api/projects/add", post(project_add))
         .route("/api/projects/remove", post(project_remove))
         .route("/api/projects/rename", post(project_rename))
+        .route("/api/projects/repository", post(project_repository))
         .route("/api/github/projects", get(gh_projects))
         .route("/api/github/repos", get(gh_repos))
         .route("/api/sync", post(sync))
@@ -182,6 +183,13 @@ async fn put_settings(AxState(app): AxState<AppRef>, Json(mut new): Json<Setting
         }
         *app.project.lock() = None;
     }
+    if new.repository != old.repository {
+        if let Some(repo) = new.default_repo() {
+            if let Err(e) = link_repository(&app, &repo).await {
+                app.notice("warn", format!("Could not link {repo} to the project on GitHub: {e}"));
+            }
+        }
+    }
     app.wake.notify_one();
     Ok(Json(json!(new.redacted())))
 }
@@ -199,7 +207,12 @@ async fn test_github(AxState(app): AxState<AppRef>) -> R {
             .filter(|c| !c.is_empty() && p.option_id(c).is_none())
             .map(|c| c.as_str())
             .collect();
-        out["project"] = json!({"title": p.title, "url": p.url, "columns": cols, "missing_columns": missing});
+        out["project"] = json!({"title": p.title, "url": p.url, "columns": cols, "missing_columns": missing, "linked_repositories": p.repos});
+        out["repository"] = match s.default_repo() {
+            None => json!("none: link one in Settings → Project"),
+            Some(r) if p.repos.iter().any(|x| x.eq_ignore_ascii_case(&r)) => json!(format!("{r} (linked)")),
+            Some(r) => json!(format!("{r} (not linked to the project on GitHub)")),
+        };
     }
     Ok(Json(out))
 }
@@ -219,6 +232,9 @@ async fn sync(AxState(app): AxState<AppRef>) -> R {
 async fn engine_toggle(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
     let mut s = app.db.settings();
     s.engine_enabled = b["enabled"].as_bool().unwrap_or(false);
+    if s.engine_enabled && s.default_repo().is_none() {
+        return Err(anyhow::anyhow!("Link a GitHub repository to this project first (Settings → Project → Repository)").into());
+    }
     app.db.save_settings(&s)?;
     app.wake.notify_one();
     app.notice("info", if s.engine_enabled { "Engine started" } else { "Engine paused (running agents finish their current step)" });
@@ -275,7 +291,7 @@ async fn del_skill(AxState(app): AxState<AppRef>, Path(name): Path<String>) -> R
 
 async fn plan(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
     let goal = b["goal"].as_str().unwrap_or("").trim().to_string();
-    let repo = b["repo"].as_str().unwrap_or("").trim().to_string();
+    let repo = b["repo"].as_str().map(str::trim).filter(|r| !r.is_empty()).map(String::from).or_else(|| app.db.settings().default_repo()).unwrap_or_default();
     if !(!goal.is_empty()) { return Err(anyhow::anyhow!("goal is empty").into()); }
     if !(repo.contains('/')) { return Err(anyhow::anyhow!("pick a repository (owner/name)").into()); }
     // Planning can take a while: run it in the background, result arrives via SSE.
@@ -290,7 +306,8 @@ async fn plan(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
 }
 
 async fn plan_apply(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
-    let repo = b["repo"].as_str().unwrap_or("").to_string();
+    let repo = b["repo"].as_str().map(str::trim).filter(|r| !r.is_empty()).map(String::from).or_else(|| app.db.settings().default_repo()).unwrap_or_default();
+    if !repo.contains('/') { return Err(anyhow::anyhow!("pick a repository (owner/name)").into()); }
     let tickets = b["tickets"].as_array().cloned().unwrap_or_default();
     let start = b["start"].as_bool().unwrap_or(true);
     if !(!tickets.is_empty()) { return Err(anyhow::anyhow!("no tickets").into()); }
@@ -358,6 +375,14 @@ async fn project_add(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
         let gh = app.github().await?;
         let info = gh.project(&owner, number, &s.status_field).await?;
         let name = b["title"].as_str().filter(|t| !t.is_empty()).unwrap_or(&info.title).to_string();
+        s.repository = b["repository"].as_str().map(str::trim).filter(|r| r.contains('/')).map(String::from)
+            .or_else(|| info.repos.first().cloned())
+            .unwrap_or_default();
+        if !s.repository.is_empty() && !info.repos.iter().any(|r| r.eq_ignore_ascii_case(&s.repository)) {
+            if let Err(e) = gh.link_repo(&info.id, &s.repository).await {
+                app.notice("warn", format!("Could not link {} to the project on GitHub: {e}", s.repository));
+            }
+        }
         list.push(s.to_profile(&name));
     }
     activate(&app, list, &key).await?;
@@ -381,6 +406,34 @@ async fn project_rename(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> 
     }
     app.db.save_projects(&list);
     Ok(Json(json!({"ok": true})))
+}
+
+/// Link `repo` to the active project on GitHub (if not already linked).
+async fn link_repository(app: &AppRef, repo: &str) -> anyhow::Result<bool> {
+    let gh = app.github().await?;
+    let p = app.project_info(&gh, true).await?;
+    if p.repos.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
+        return Ok(false);
+    }
+    gh.link_repo(&p.id, repo).await?;
+    let _ = app.project_info(&gh, true).await;
+    Ok(true)
+}
+
+/// Couple a GitHub repository to the active project: saved in the project's settings
+/// and linked to the project on GitHub.
+async fn project_repository(AxState(app): AxState<AppRef>, Json(b): Json<Value>) -> R {
+    let repo = b["repo"].as_str().unwrap_or("").trim().trim_end_matches(".git").trim_matches('/').to_string();
+    if !repo.contains('/') { return Err(anyhow::anyhow!("repository must be owner/name").into()); }
+    let gh = app.github().await?;
+    gh.default_branch(&repo).await.map_err(|e| anyhow::anyhow!("repository {repo} not reachable: {e}"))?;
+    let mut s = app.db.settings();
+    s.repository = repo.clone();
+    app.db.save_settings(&s)?;
+    let linked = link_repository(&app, &repo).await?;
+    app.notice("info", if linked { format!("{repo} linked to the project") } else { format!("{repo} is the project's repository") });
+    let project = app.project.lock().clone();
+    Ok(Json(json!({"repository": repo, "linked_now": linked, "project": project})))
 }
 
 async fn gh_projects(AxState(app): AxState<AppRef>) -> R {

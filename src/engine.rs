@@ -2,7 +2,7 @@
 //!  - sync loop   : GitHub Project ⇄ local tickets (polling, no public webhook needed)
 //!  - scheduler   : drives every ticket through the state machine
 //!  - triage      : orchestrator agent routes / splits / asks for clarification
-//!  - worker      : specialist agent codes in an isolated worktree → PR
+//!  - worker      : specialist agent codes in its own clone (.maestro_workspaces) → PR
 //!  - review      : reviewer agent approves or sends feedback (loop)
 
 use crate::agents::{Agent, Team};
@@ -119,6 +119,13 @@ pub async fn sync_once(app: &AppRef) -> Result<usize> {
     let s = app.db.settings();
     let gh = app.github().await?;
     let project = app.project_info(&gh, true).await?;
+    if s.default_repo().is_none() && project.repos.len() == 1 {
+        // the project has exactly one linked repository: couple it automatically
+        let mut s2 = app.db.settings();
+        s2.repository = project.repos[0].clone();
+        app.db.save_settings(&s2)?;
+        app.notice("info", format!("Project repository set to {}", s2.repository));
+    }
     let items = gh.items(&project.id, &s.status_field).await?;
     let n = items.len();
     let mut keep = vec![];
@@ -163,14 +170,30 @@ pub async fn sync_once(app: &AppRef) -> Result<usize> {
         }
         if t.state == State::AwaitingMerge {
             if let Some(pr) = t.pr_number {
-                match gh.pr_state(&t.repo, pr).await.as_deref() {
-                    Ok("merged") => {
+                match gh.pr_state(&t.repo, pr).await {
+                    Ok((st, _)) if st == "merged" => {
                         app.transition(t.id, State::Done, "PR merged");
                         set_gh_status(app, &gh, &t, &s.col_done).await;
                         git::cleanup(app, &t).await;
                     }
-                    Ok("closed") => {
+                    Ok((st, _)) if st == "closed" => {
                         app.transition(t.id, State::NeedsHuman, "PR closed without merge");
+                    }
+                    // Another PR landed and now conflicts with this one: back to the agent.
+                    Ok((_, Some(false))) if !app.busy.lock().contains(&t.id) => {
+                        let base = base_branch(app, &gh, &t.repo).await;
+                        let fb = conflict_feedback(&base, &format!("refs/maestro/base/{base}"), &[]);
+                        if t.review_rounds >= s.max_review_rounds {
+                            if t.note.as_deref() != Some("PR has merge conflicts") {
+                                let _ = app.db.set_field(t.id, "note", "PR has merge conflicts");
+                                app.transition(t.id, State::NeedsHuman, "merge conflicts, review rounds exhausted");
+                            }
+                        } else {
+                            let _ = app.db.set_field(t.id, "review_rounds", t.review_rounds + 1);
+                            let _ = app.db.set_field(t.id, "feedback", &fb);
+                            app.transition(t.id, State::Ready, "merge conflict with base, back to the agent");
+                            gh_comment(app, &gh, &t, &format!("🔀 **Maestro** — the PR conflicts with `{base}`, sending it back to `{}` to resolve.", t.agent.as_deref().unwrap_or("the agent"))).await;
+                        }
                     }
                     _ => {}
                 }
@@ -311,13 +334,26 @@ fn plan_schema() -> Value {
     })
 }
 
+/// Base branch to work from: the project setting, or the repository default.
+async fn base_branch(app: &App, gh: &Github, repo: &str) -> String {
+    let s = app.db.settings();
+    if s.base_branch.trim().is_empty() {
+        gh.default_branch(repo).await.unwrap_or_else(|_| "main".into())
+    } else {
+        s.base_branch.trim().to_string()
+    }
+}
+
+/// Read-only, up-to-date snapshot of the base branch (its own clone, never a worker's).
 async fn orchestrator_cwd(app: &App, repo: &str) -> std::path::PathBuf {
     if repo.is_empty() {
         return app.data.clone();
     }
     if let Ok(gh) = app.github().await {
-        if let Ok(p) = git::ensure_repo(app, gh.token(), repo).await {
-            return p;
+        let base = base_branch(app, &gh, repo).await;
+        match git::snapshot(app, gh.token(), repo, &base).await {
+            Ok(p) => return p,
+            Err(e) => app.notice("warn", format!("snapshot of {repo}: {e}")),
         }
     }
     app.data.clone()
@@ -494,7 +530,11 @@ pub struct NewTicket {
 
 pub async fn create_one(app: &App, gh: &Github, n: NewTicket) -> Result<Ticket> {
     let s = app.db.settings();
-    anyhow::ensure!(n.repo.contains('/'), "repository must be owner/name");
+    let mut n = n;
+    if n.repo.trim().is_empty() {
+        n.repo = app.db.settings().default_repo().unwrap_or_default();
+    }
+    anyhow::ensure!(n.repo.contains('/'), "repository must be owner/name (or link a repository to the project)");
     anyhow::ensure!(!n.title.trim().is_empty(), "title is empty");
     let project = app.project_info(gh, false).await?;
     let assignee = n.assignee.filter(|a| !a.is_empty());
@@ -626,7 +666,7 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
     let assignee = t0.agent.clone().context("no agent assigned")?;
     let team = app.lib.team(&assignee, &t0.helpers)?;
     let agent_name = team.name.clone();
-    let base = if s.base_branch.trim().is_empty() { gh.default_branch(&t0.repo).await.unwrap_or_else(|_| "main".into()) } else { s.base_branch.clone() };
+    let base = base_branch(app, &gh, &t0.repo).await;
 
     app.transition(id, State::Running, &format!("{agent_name} started"));
     set_gh_status(app, &gh, &t0, &s.col_in_progress).await;
@@ -653,16 +693,18 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
             .join("\n");
         let feedback = t.feedback.clone().map(|f| format!("\n## ⚠️ Reviewer feedback to address (round {})\n{f}\n", t.review_rounds)).unwrap_or_default();
         let prompt = format!(
-            "You are working on GitHub issue {}#{} on branch `{}` (git worktree, base `{}`).\n\n# {}\n\n{}\n{}{}\n## Dependencies\n{}\n\n## Discussion\n{}\n{}\n\
+            "You are working on GitHub issue {}#{} on branch `{}` (your own clone of the repository, base `{}`; the latest base is fetched at `{}`).\n\n# {}\n\n{}\n{}{}\n## Dependencies\n{}\n\n## Discussion\n{}\n{}\n\
              ## Instructions\n- Implement the ticket completely in this repository. Follow existing conventions.\n\
              - Build / run tests when the project has them; fix what you break.\n\
              - Commit your work with clear messages (`git add` + `git commit`). Do NOT push and do NOT open a PR — Maestro does that.\n\
+             - Other agents work in parallel in their own clones. If the feedback mentions merge conflicts, run `git merge {}`, resolve every conflict (keep both sides' intent), build/test, and commit the merge.\n\
              - If you find work that is out of scope (bug, follow-up, missing feature), do not do it: create a ticket with the `maestro` tools when they are available (`create_ticket`), and mention it in your summary.\n\
              - Finish with a short markdown summary of what you changed and anything a human must check.",
-            t.repo, t.number, ws.branch, base, t.title, t.body, parent_ctx, "",
+            t.repo, t.number, ws.branch, base, ws.base_ref, t.title, t.body, parent_ctx, "",
             if deps_ctx.is_empty() { "(none)".into() } else { deps_ctx },
             comments.iter().rev().take(10).rev().map(|(u, b)| format!("**{u}**: {b}")).collect::<Vec<_>>().join("\n\n"),
-            feedback
+            feedback,
+            ws.base_ref
         );
 
         let out = run_team(app, id, &team, &ws.path, prompt).await?;
@@ -705,9 +747,31 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
         let t = app.db.ticket(id).context("ticket gone")?;
         set_gh_status(app, &gh, &t, &s.col_review).await;
 
+        // ---- merge conflicts with the latest base (other agents' PRs may have landed)
+        let conflicts = match git::conflicts(app, gh.token(), &t.repo, &ws, &base).await {
+            Ok(c) => c,
+            Err(e) => {
+                app.notice("warn", format!("#{}: conflict check skipped: {e}", t.number));
+                vec![]
+            }
+        };
+        let conflict_issue = (!conflicts.is_empty()).then(|| conflict_feedback(&base, &ws.base_ref, &conflicts));
+
         if !s.review_enabled {
-            app.transition(id, State::AwaitingMerge, "PR opened");
-            return maybe_merge(app, &gh, id).await;
+            match &conflict_issue {
+                None => {
+                    app.transition(id, State::AwaitingMerge, "PR opened");
+                    return maybe_merge(app, &gh, id).await;
+                }
+                Some(c) => {
+                    app.transition(id, State::Reviewing, "PR opened, merge conflicts");
+                    let _ = gh.review_comment(&t.repo, pr, &format!("🔀 **Maestro** — {c}")).await;
+                    if !send_back(app, id, "Merge conflicts", c)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
         }
 
         // ---- review
@@ -715,10 +779,19 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
         let reviewer = app.lib.agent(&s.reviewer_agent).ok_or_else(|| anyhow!("reviewer agent '{}' not found", s.reviewer_agent))?;
         let rrun = app.db.create_run(Some(id), "review", &reviewer.meta.name)?;
         app.emit(Event::Run { run: rrun.clone() });
+        let conflict_ctx = if conflicts.is_empty() {
+            format!("Maestro checked that the branch merges cleanly into the latest `{base}`.")
+        } else {
+            format!(
+                "⚠️ Maestro detected MERGE CONFLICTS with the latest `{base}` (`{}`), in: {}.\n\
+                 A conflicting branch cannot be approved: set `approve` to false and list the conflicts in `issues` (with what each side changed, from `git log {}..HEAD` and `git log HEAD..{}`), so the author can resolve them.",
+                ws.base_ref, conflicts.join(", "), ws.base_ref, ws.base_ref
+            )
+        };
         let rprompt = format!(
-            "Review the changes on this branch for issue #{} \"{}\".\n\n## Ticket\n{}\n\nInspect with `git diff {}...HEAD` and `git log {}..HEAD`, read the touched files, and verify the acceptance criteria.\n\
+            "Review the changes on this branch for issue #{} \"{}\".\n\n## Ticket\n{}\n\n## Merge status\n{}\n\nInspect with `git diff {}...HEAD` and `git log {}..HEAD`, read the touched files, and verify the acceptance criteria.\n\
              Approve if it correctly and safely implements the ticket. Only list *blocking* issues. Answer ONLY with the JSON object.",
-            t.number, t.title, t.body, ws.base_ref, ws.base_ref
+            t.number, t.title, t.body, conflict_ctx, ws.base_ref, ws.base_ref
         );
         let plugin = app.lib.build_plugin(&reviewer)?;
         let rout = claude::run(app, Request { run_id: rrun.id, cwd: &ws.path, agent: &reviewer, prompt: rprompt, json_schema: Some(review_schema()), plugin_dir: plugin, tools: None, read_only: true, subagents: None, mcp: None }).await?;
@@ -734,14 +807,18 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
             app.transition(id, State::NeedsHuman, "reviewer failed");
             return Ok(());
         };
-        let approve = v["approve"].as_bool().unwrap_or(false);
+        // A conflicting branch is never approved, whatever the reviewer says.
+        let approve = v["approve"].as_bool().unwrap_or(false) && conflict_issue.is_none();
         let summary = v["summary"].as_str().unwrap_or("").to_string();
-        let issues: Vec<String> = v["issues"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        let mut issues: Vec<String> = v["issues"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        if let Some(c) = &conflict_issue {
+            issues.insert(0, c.clone());
+        }
         let _ = gh
             .review_comment(&t.repo, pr, &format!(
                 "🔍 **Maestro review** (`{}`) — {}\n\n{}\n{}",
                 reviewer.meta.name,
-                if approve { "✅ approved" } else { "🔁 changes requested" },
+                if approve { "✅ approved" } else if conflict_issue.is_some() { "🔀 merge conflicts, changes requested" } else { "🔁 changes requested" },
                 summary,
                 issues.iter().map(|i| format!("- {i}")).collect::<Vec<_>>().join("\n")
             ))
@@ -750,20 +827,36 @@ async fn work(app: &AppRef, id: i64) -> Result<()> {
             app.transition(id, State::AwaitingMerge, "review approved");
             return maybe_merge(app, &gh, id).await;
         }
-        let t = app.db.ticket(id).context("ticket gone")?;
-        if t.review_rounds >= s.max_review_rounds {
-            app.db.set_field(id, "note", format!("Review not passed after {} rounds: {summary}", t.review_rounds))?;
-            app.transition(id, State::NeedsHuman, "review rounds exhausted");
+        let fb = format!("{summary}\n\n{}", issues.iter().map(|i| format!("- {i}")).collect::<Vec<_>>().join("\n"));
+        if !send_back(app, id, &summary, &fb)? {
             return Ok(());
         }
-        app.db.set_field(id, "review_rounds", t.review_rounds + 1)?;
-        app.db.set_field(id, "feedback", format!("{summary}\n\n{}", issues.iter().map(|i| format!("- {i}")).collect::<Vec<_>>().join("\n")))?;
-        app.transition(id, State::Running, "changes requested");
-        // loop: same worktree, agent fixes the feedback, push updates the PR
+        // loop: same clone, agent fixes the feedback (and conflicts), push updates the PR
     }
 }
 
-/// Run a team on a ticket's worktree.
+fn conflict_feedback(base: &str, base_ref: &str, files: &[String]) -> String {
+    let r#where = if files.is_empty() { String::new() } else { format!(" in: {}", files.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")) };
+    format!("Merge conflicts with the latest `{base}`{where}. Run `git merge {base_ref}`, resolve every conflict, build/test, and commit the merge.")
+}
+
+/// Reviewing → Running with `feedback` for the worker, bounded by the review rounds.
+/// Returns false when the rounds are exhausted (ticket moved to needs_human).
+fn send_back(app: &App, id: i64, summary: &str, feedback: &str) -> Result<bool> {
+    let s = app.db.settings();
+    let t = app.db.ticket(id).context("ticket gone")?;
+    if t.review_rounds >= s.max_review_rounds {
+        app.db.set_field(id, "note", format!("Review not passed after {} rounds: {summary}", t.review_rounds))?;
+        app.transition(id, State::NeedsHuman, "review rounds exhausted");
+        return Ok(false);
+    }
+    app.db.set_field(id, "review_rounds", t.review_rounds + 1)?;
+    app.db.set_field(id, "feedback", feedback)?;
+    app.transition(id, State::Running, "changes requested");
+    Ok(true)
+}
+
+/// Run a team in a ticket's workspace.
 ///  - single agent / delegate: one Claude session; members are declared as subagents.
 ///  - pipeline: lead then members, one session each, summaries passed along.
 async fn run_team(app: &App, ticket: i64, team: &Team, cwd: &std::path::Path, prompt: String) -> Result<claude::Outcome> {

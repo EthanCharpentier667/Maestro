@@ -41,7 +41,7 @@ pub fn config_for(app: &App, ticket: i64, agent: &Agent) -> Result<Option<PathBu
 
 fn tools() -> Value {
     let num = json!({"type": "integer", "description": "issue number"});
-    let repo = json!({"type": "string", "description": "owner/name; defaults to the repository of the current ticket"});
+    let repo = json!({"type": "string", "description": "owner/name; defaults to the repository of the current ticket, then the project's repository"});
     json!([
       {"name": "list_tickets", "description": "List tickets on the board with their Maestro state, assignee and dependencies.",
        "inputSchema": {"type": "object", "properties": {
@@ -128,7 +128,7 @@ async fn call(app: &AppRef, c: &Caller, name: &str, args: &Value) -> Result<Valu
                 }
                 *n += 1;
             }
-            let repo = args["repo"].as_str().filter(|r| !r.is_empty()).map(String::from).or_else(|| c.ticket.as_ref().map(|t| t.repo.clone()));
+            let repo = args["repo"].as_str().filter(|r| !r.is_empty()).map(String::from).or_else(|| c.ticket.as_ref().map(|t| t.repo.clone())).or_else(|| app.db.settings().default_repo());
             let repo = repo.ok_or_else(|| anyhow!("`repo` is required"))?;
             let mut deps = vec![];
             for n in args["depends_on"].as_array().cloned().unwrap_or_default() {

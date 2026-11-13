@@ -16,7 +16,7 @@ pub enum State {
     Blocked,
     /// Routed to an agent, waiting for a free worker slot.
     Ready,
-    /// A specialist agent is working on it in its own git worktree.
+    /// A specialist agent is working on it in its own clone of the repository.
     Running,
     /// PR opened, reviewer agent is checking it.
     Reviewing,
@@ -97,6 +97,7 @@ pub const TRANSITIONS: &[(State, State, &str)] = &[
     (State::Reviewing, State::Running, "changes requested"),
     (State::Reviewing, State::NeedsHuman, "review failed"),
     (State::AwaitingMerge, State::Done, "PR merged / issue closed"),
+    (State::AwaitingMerge, State::Ready, "merge conflict, back to the agent"),
     (State::NeedsHuman, State::Triage, "human: retriage"),
     (State::NeedsHuman, State::Ready, "human: retry"),
     (State::Paused, State::Triage, "resume"),
@@ -202,6 +203,9 @@ pub struct Settings {
     /// Tickets created by agents through MCP are queued right away (otherwise: backlog).
     pub mcp_auto_queue: bool,
     // --- Git
+    /// GitHub repository (owner/name) coupled to the active project: default target
+    /// for new tickets and the planner, linked to the project on GitHub.
+    pub repository: String,
     pub base_branch: String,
     pub repo_paths: String, // "owner/repo=/abs/path" one per line
     pub git_author_name: String,
@@ -277,6 +281,12 @@ impl Settings {
         Settings::default().apply_env()
     }
 
+    /// The project's repository, if one is linked.
+    pub fn default_repo(&self) -> Option<String> {
+        let r = self.repository.trim().trim_end_matches(".git").trim_matches('/');
+        r.contains('/').then(|| r.to_string())
+    }
+
     pub fn repo_path(&self, repo: &str) -> Option<String> {
         self.repo_paths.lines().find_map(|l| {
             let (k, v) = l.split_once('=')?;
@@ -300,6 +310,7 @@ pub struct ProjectProfile {
     pub col_review: String,
     pub col_done: String,
     pub col_blocked: String,
+    pub repository: String,
     pub base_branch: String,
     pub repo_paths: String,
 }
@@ -329,6 +340,7 @@ impl Settings {
             col_review: self.col_review.clone(),
             col_done: self.col_done.clone(),
             col_blocked: self.col_blocked.clone(),
+            repository: self.repository.clone(),
             base_branch: self.base_branch.clone(),
             repo_paths: self.repo_paths.clone(),
         }
@@ -343,6 +355,7 @@ impl Settings {
         self.col_review = p.col_review.clone();
         self.col_done = p.col_done.clone();
         self.col_blocked = p.col_blocked.clone();
+        self.repository = p.repository.clone();
         self.base_branch = p.base_branch.clone();
         self.repo_paths = p.repo_paths.clone();
     }
