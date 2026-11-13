@@ -3,41 +3,51 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Maestro — AI orchestrator</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎼</text></svg>">
+<meta name="color-scheme" content="dark light">
+<title>Maestro</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%238b7bff'/><stop offset='1' stop-color='%235b4cf0'/></linearGradient></defs><rect width='32' height='32' rx='8' fill='url(%23g)'/><path d='M8 22V10l8 8 8-8v12' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<script>
+  // apply the saved / system theme before first paint (no flash)
+  (function () { var t = null; try { t = localStorage.getItem('maestro-theme'); } catch (e) {}
+    if (t !== 'light' && t !== 'dark') t = window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', t); })();
+</script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<aside class="side">
-  <div class="brand"><span class="logo">🎼</span><div><b>Maestro</b><small>AI orchestrator</small></div></div>
+<aside class="side" id="side">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 17V7l7 7 7-7v10"/></svg></span>
+    <div class="brand-txt"><b>Maestro</b><small>Agent orchestrator</small></div>
+  </div>
   <div id="proj-switch" class="proj-switch-wrap"></div>
-  <nav id="nav">
-    <a data-view="board" class="active"><i>▦</i>Board</a>
-    <a data-view="graph"><i>⌬</i>Graph</a>
-    <a data-view="machine"><i>⟳</i>State machine</a>
-    <a data-view="planner"><i>✦</i>Planner</a>
-    <a data-view="agents"><i>◉</i>Agents, cells, skills</a>
-    <a data-view="runs"><i>≣</i>Runs &amp; logs</a>
-    <a data-view="settings"><i>⚙</i>Settings</a>
-  </nav>
-  <div class="side-foot" id="side-foot"></div>
+  <nav id="nav" aria-label="Main"></nav>
+  <div class="side-foot">
+    <div id="side-foot"></div>
+    <button class="theme-toggle" id="btn-theme" type="button" title="Toggle light / dark theme"></button>
+  </div>
 </aside>
+<div class="side-scrim" id="side-scrim"></div>
 
 <main>
   <header class="top">
-    <div class="proj" id="proj">—</div>
+    <button class="icon-btn menu-btn" id="btn-menu" type="button" title="Menu" aria-label="Open menu"></button>
+    <div class="top-title">
+      <h1 id="page-title">Board</h1>
+      <div class="proj" id="proj">—</div>
+    </div>
     <div class="kpis" id="kpis"></div>
     <div class="top-actions">
       <span class="sync-info" id="sync-info"></span>
-      <button class="btn ghost" id="btn-sync" title="Sync GitHub now">⟳ Sync</button>
-      <button class="btn engine" id="btn-engine">▶ Start engine</button>
+      <button class="btn" id="btn-sync" type="button" title="Sync GitHub now">Sync</button>
+      <button class="btn engine" id="btn-engine" type="button">Start engine</button>
     </div>
   </header>
   <section id="view"></section>
 </main>
 
 <div id="drawer" class="drawer hidden"><div class="drawer-inner" id="drawer-inner"></div></div>
-<div id="toasts"></div>
+<div id="toasts" aria-live="polite"></div>
 <script src="/app.js"></script>
 </body>
 </html>
